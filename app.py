@@ -188,6 +188,7 @@ if not item_bills.empty:
         left_on=["Item_Name_Bill", "Vendor Name"],
         right_on=["Item Name", "Vendor Name"],
         how="inner",
+        suffixes=("_bill", ""),
     )
     merged_parts.append(merged_b)
 
@@ -196,6 +197,18 @@ if not merged_parts:
     st.stop()
 
 f_df = pd.concat(merged_parts, ignore_index=True)
+
+# Guarantee Item Name column exists (suffix issues across concat paths)
+if "Item Name" not in f_df.columns:
+    if "Item Name_bill" in f_df.columns:
+        f_df["Item Name"] = f_df["Item Name_bill"]
+    elif "Item_Name_Bill" in f_df.columns:
+        f_df["Item Name"] = f_df["Item_Name_Bill"]
+    else:
+        f_df["Item Name"] = "Unknown"
+# Fill any NaN Item Names from Item_Name_Bill fallback
+if "Item_Name_Bill" in f_df.columns:
+    f_df["Item Name"] = f_df["Item Name"].fillna(f_df["Item_Name_Bill"])
 
 # ── CALCULATIONS ───────────────────────────────────────────────────────────────
 f_df["Lead_Time"] = (
