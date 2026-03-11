@@ -91,6 +91,7 @@ if st.sidebar.button("Process & Update Data"):
                 std["Item_Name_Bill"] = None          # no item-level detail
                 std["Inv_Qty"] = None                 # will fall back to PO qty
                 std["Bill_Amount"] = clean_currency(temp["Amount"])
+                std["Invoice_Number"] = temp["Bill#"].astype(str).str.strip() if "Bill#" in temp.columns else None
                 std = std[std["PO_Ref"].notna() & (std["PO_Ref"] != "nan")]
                 all_bills.append(std)
 
@@ -114,6 +115,7 @@ if st.sidebar.button("Process & Update Data"):
                 std["Bill_Amount"] = pd.to_numeric(
                     temp["Item Total"], errors="coerce"
                 )
+                std["Invoice_Number"] = temp["Bill Number"].astype(str).str.strip() if "Bill Number" in temp.columns else None
                 all_bills.append(std)
 
     if all_bills:
@@ -160,7 +162,7 @@ bill_db["Bill_Date"] = pd.to_datetime(bill_db["Bill_Date"], errors="coerce")
 #
 
 # Ensure expected columns exist (they may be absent if loaded from an older Excel snapshot)
-for col in ["PO_Ref", "Item_Name_Bill", "Inv_Qty", "Bill_Amount", "Vendor Name", "Bill_Date"]:
+for col in ["PO_Ref", "Item_Name_Bill", "Inv_Qty", "Bill_Amount", "Vendor Name", "Bill_Date", "Invoice_Number"]:
     if col not in bill_db.columns:
         bill_db[col] = None
 
@@ -325,8 +327,15 @@ if vendor_choice == "All Vendors":
 # ── FULFILLMENT TABLE ──────────────────────────────────────────────────────────
 st.subheader("📋 Fulfillment Record")
 
+# Build Invoice_Number column (may be missing on older cached Excel)
+if "Invoice_Number" not in view_df.columns:
+    view_df = view_df.copy()
+    view_df["Invoice_Number"] = "-"
+view_df["Invoice_Number"] = view_df["Invoice_Number"].fillna("-")
+
 display_cols = {
     "Purchase Order Number": "PO Number",
+    "Invoice_Number": "Invoice Number",
     "Purchase Order Date": "PO Date",
     "Vendor Name": "Vendor",
     "Item Name Display": "Item",
@@ -354,6 +363,56 @@ st.download_button(
     file_name="fulfillment_report.csv",
     mime="text/csv",
 )
+
+# ── REMOVE PO DATA ─────────────────────────────────────────────────────────────
+st.divider()
+st.subheader("🗑️ Remove PO Data")
+st.caption("Select one or more POs to permanently delete all their bill records from the database.")
+
+all_pos = sorted(f_df["Purchase Order Number"].dropna().unique().tolist())
+pos_to_remove = st.multiselect(
+    "Select PO(s) to remove",
+    options=all_pos,
+    placeholder="Choose PO numbers...",
+)
+
+if pos_to_remove:
+    affected = f_df[f_df["Purchase Order Number"].isin(pos_to_remove)]
+    st.warning(
+        f"This will remove **{len(affected)} record(s)** across "
+        f"**{affected['Item Name Display'].nunique()} SKU(s)** "
+        f"for: {', '.join(pos_to_remove)}"
+    )
+    if st.button("⚠️ Confirm Removal", type="primary"):
+        # Remove matching PO rows from po_db and corresponding bill rows
+        po_db_new = po_db[~po_db["Purchase Order Number"].isin(pos_to_remove)].copy()
+
+        # Remove from bill_db: rows where PO_Ref matches (ref-based bills)
+        # and rows where Item_Name_Bill matches items in the removed POs (item-based bills)
+        removed_items = po_db[po_db["Purchase Order Number"].isin(pos_to_remove)]["Item Name"].unique()
+        removed_vendors = po_db[po_db["Purchase Order Number"].isin(pos_to_remove)]["Vendor Name"].unique()
+
+        bill_db_new = bill_db.copy()
+        # Drop ref-based rows
+        if "PO_Ref" in bill_db_new.columns:
+            bill_db_new = bill_db_new[
+                ~(bill_db_new["PO_Ref"].isin(pos_to_remove))
+            ]
+        # Drop item-based rows (same item + vendor combination)
+        if "Item_Name_Bill" in bill_db_new.columns:
+            bill_db_new = bill_db_new[
+                ~(
+                    bill_db_new["Item_Name_Bill"].isin(removed_items) &
+                    bill_db_new["Vendor Name"].isin(removed_vendors)
+                )
+            ]
+
+        with pd.ExcelWriter(DB_FILE, engine="openpyxl") as writer:
+            po_db_new.to_excel(writer, sheet_name="POs", index=False)
+            bill_db_new.to_excel(writer, sheet_name="Bills", index=False)
+
+        st.success(f"✅ Removed data for: {', '.join(pos_to_remove)}")
+        st.rerun()
 
 # ── RESET ──────────────────────────────────────────────────────────────────────
 st.sidebar.divider()
