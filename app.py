@@ -5,8 +5,9 @@ import os
 
 st.set_page_config(page_title="Weighted Lead Time Tracker", layout="wide")
 
-TARGET_VENDORS = ["Candor Foods Pvt Ltd.", "Evergreen Foods and Snacks Pvt Ltd"]
-DB_FILE = "vendor_analytics_db.xlsx"
+DB_FILE      = "vendor_analytics_db.xlsx"
+VENDORS_FILE = "tracked_vendors.txt"
+DEFAULT_VENDORS = ["Candor Foods Pvt Ltd.", "Evergreen Foods and Snacks Pvt Ltd"]
 
 
 # ── HELPERS ────────────────────────────────────────────────────────────────────
@@ -17,6 +18,22 @@ def clean_currency(series: pd.Series) -> pd.Series:
         .str.replace(r"[₹,\s]", "", regex=True)
         .pipe(pd.to_numeric, errors="coerce")
     )
+
+
+def load_tracked_vendors() -> list:
+    if os.path.exists(VENDORS_FILE):
+        try:
+            vendors = [v.strip() for v in open(VENDORS_FILE).read().splitlines() if v.strip()]
+            if vendors:
+                return vendors
+        except Exception:
+            pass
+    return list(DEFAULT_VENDORS)
+
+
+def save_tracked_vendors(vendors: list):
+    with open(VENDORS_FILE, "w") as fh:
+        fh.write("\n".join(v.strip() for v in vendors if v.strip()))
 
 
 def load_db():
@@ -33,9 +50,39 @@ def load_db():
 
 
 po_db, b1_db, b2_db = load_db()
+TARGET_VENDORS = load_tracked_vendors()
 
 
 # ── SIDEBAR ────────────────────────────────────────────────────────────────────
+
+with st.sidebar.expander("⚙️ Vendor Settings", expanded=False):
+    st.caption("Add or remove vendors to track. Only these vendors are imported from uploaded files.")
+    new_vendor_input = st.text_input(
+        "Add a new vendor (exact name as in files)",
+        placeholder="e.g. ABC Suppliers Pvt Ltd.",
+        key="new_vendor_input",
+    )
+    if st.button("➕ Add Vendor", key="add_vendor_btn"):
+        nv = new_vendor_input.strip()
+        if nv and nv not in TARGET_VENDORS:
+            TARGET_VENDORS.append(nv)
+            save_tracked_vendors(TARGET_VENDORS)
+            st.success(f"Added: {nv}")
+            st.rerun()
+        elif nv in TARGET_VENDORS:
+            st.warning("Already tracked.")
+    st.markdown("**Currently tracked:**")
+    vendors_to_keep = []
+    for v in TARGET_VENDORS:
+        if st.checkbox(v, value=True, key=f"vchk_{v}"):
+            vendors_to_keep.append(v)
+    if st.button("💾 Save Vendor List", key="save_vendors_btn"):
+        if not vendors_to_keep:
+            st.error("At least one vendor must remain.")
+        else:
+            save_tracked_vendors(vendors_to_keep)
+            st.rerun()
+
 st.sidebar.header("📂 Data Management")
 po_file    = st.sidebar.file_uploader("Upload Purchase Order CSV", type="csv")
 bill_files = st.sidebar.file_uploader("Upload Bill CSVs", type="csv", accept_multiple_files=True)
@@ -260,25 +307,44 @@ f_df = f_df[f_df["Lead_Time"] >= 0].copy()
 f_df["W_Comp"]            = f_df["Lead_Time"] * f_df["Inv_Qty"]
 f_df["Item Name Display"] = f_df["Item Name"].str.title()
 
-# Fulfilment: total invoiced qty per PO+item across all invoices
 inv_totals = (
     f_df.groupby(["Purchase Order Number", "Item Name"])["Inv_Qty"]
-    .sum()
-    .reset_index()
-    .rename(columns={"Inv_Qty": "Total_Inv_Qty"})
+    .sum().reset_index().rename(columns={"Inv_Qty": "Total_Inv_Qty"})
 )
 f_df = pd.merge(f_df, inv_totals, on=["Purchase Order Number", "Item Name"], how="left")
 f_df["Fulfillment_Pct"] = (f_df["Total_Inv_Qty"] / f_df["QuantityOrdered"] * 100).clip(upper=100).round(1)
+f_df["Supply_Status"]   = f_df["Fulfillment_Pct"].apply(
+    lambda x: "🟡 Partially Supplied" if x < 100 else "🟢 Fully Supplied"
+)
+
+# ── UNINVOICED PO ROWS ────────────────────────────────────────────────────────
+matched_keys = set(zip(f_df["Purchase Order Number"], f_df["Item Name"]))
+unmatched_po = po_db[
+    ~po_db.apply(lambda r: (r["Purchase Order Number"], r["Item Name"]) in matched_keys, axis=1)
+].copy()
+unmatched_po["Item Name Display"] = unmatched_po["Item Name"].str.title()
+unmatched_po["Invoice_Number"]    = "—"
+unmatched_po["Inv_Qty"]           = 0.0
+unmatched_po["Total_Inv_Qty"]     = 0.0
+unmatched_po["Fulfillment_Pct"]   = 0.0
+unmatched_po["Lead_Time"]         = pd.NA
+unmatched_po["W_Comp"]            = pd.NA
+unmatched_po["Bill_Date"]         = pd.NaT
+unmatched_po["Supply_Status"]     = "🔴 Yet to be Supplied"
+
+# all_df = invoiced + uninvoiced (fulfillment charts, table, Remove PO list)
+# lt_df  = invoiced only          (lead-time charts & WALT KPI)
+all_df = pd.concat([f_df, unmatched_po], ignore_index=True)
+
 
 def get_walt(df: pd.DataFrame) -> float:
     q = df["Inv_Qty"].sum()
     return df["W_Comp"].sum() / q if q > 0 else 0.0
 
 def get_fulfillment_pct(df: pd.DataFrame) -> float:
-    """Weighted avg fulfillment % across unique PO+item combinations."""
     unique = df.drop_duplicates(subset=["Purchase Order Number", "Item Name"])
     total_ordered  = unique["QuantityOrdered"].sum()
-    total_invoiced = unique["Total_Inv_Qty"].sum()
+    total_invoiced = unique["Total_Inv_Qty"].fillna(0).sum()
     return (total_invoiced / total_ordered * 100) if total_ordered > 0 else 0.0
 
 
@@ -287,41 +353,32 @@ col_f1, col_f2, col_f3 = st.columns(3)
 with col_f1:
     vendor_choice = st.selectbox("Filter by Vendor", ["All Vendors"] + TARGET_VENDORS)
 
-min_date = f_df["Purchase Order Date"].min().date()
-max_date = f_df["Purchase Order Date"].max().date()
+min_date = all_df["Purchase Order Date"].min().date()
+max_date = all_df["Purchase Order Date"].max().date()
 with col_f2:
     date_from = st.date_input("PO Date From", value=min_date, min_value=min_date, max_value=max_date)
 with col_f3:
     date_to   = st.date_input("PO Date To",   value=max_date, min_value=min_date, max_value=max_date)
 
-# PO number filter — list is scoped to vendor + date selection so only relevant POs show
-_pre = f_df.copy()
+_pre = all_df.copy()
 if vendor_choice != "All Vendors":
     _pre = _pre[_pre["Vendor Name"] == vendor_choice]
 _pre = _pre[
     (_pre["Purchase Order Date"].dt.date >= date_from) &
     (_pre["Purchase Order Date"].dt.date <= date_to)
 ]
-available_pos = sorted(_pre["Purchase Order Number"].dropna().unique().tolist())
+available_pos   = sorted(_pre["Purchase Order Number"].dropna().unique().tolist())
 available_items = sorted(_pre["Item Name Display"].dropna().unique().tolist())
 
 fc1, fc2 = st.columns(2)
 with fc1:
-    po_filter = st.multiselect(
-        "Filter by PO Number",
-        options=available_pos,
-        default=[],
-        placeholder="All POs (select to narrow down…)",
-    )
+    po_filter = st.multiselect("Filter by PO Number", options=available_pos, default=[],
+                               placeholder="All POs (select to narrow down…)")
 with fc2:
-    item_filter = st.multiselect(
-        "Filter by Item Name",
-        options=available_items,
-        default=[],
-        placeholder="All items (select to narrow down…)",
-    )
+    item_filter = st.multiselect("Filter by Item Name", options=available_items, default=[],
+                                 placeholder="All items (select to narrow down…)")
 
-view_df = f_df.copy()
+view_df = all_df.copy()
 if vendor_choice != "All Vendors":
     view_df = view_df[view_df["Vendor Name"] == vendor_choice]
 view_df = view_df[
@@ -337,15 +394,21 @@ if view_df.empty:
     st.warning("No data for the selected filters.")
     st.stop()
 
+lt_df = view_df[view_df["Inv_Qty"] > 0].copy()
+
 
 # ── KPIs ──────────────────────────────────────────────────────────────────────
-m1, m2, m3, m4, m5 = st.columns(5)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 unique_po_items = view_df.drop_duplicates(subset=["Purchase Order Number", "Item Name"])
+uninvoiced_pos  = view_df[view_df["Inv_Qty"] == 0]["Purchase Order Number"].nunique()
 m1.metric("Total Order Value",      f"₹{unique_po_items['Item Total'].sum():,.0f}")
 m2.metric("Total POs",              view_df["Purchase Order Number"].nunique())
-m3.metric("Total SKUs",             view_df["Item Name"].nunique())
-m4.metric("Weighted Avg Lead Time", f"{get_walt(view_df):.1f} days")
-m5.metric("Avg Fulfillment",        f"{get_fulfillment_pct(view_df):.1f}%")
+m3.metric("Yet to be Supplied",     uninvoiced_pos,
+          delta=f"-{uninvoiced_pos} pending" if uninvoiced_pos > 0 else None,
+          delta_color="inverse")
+m4.metric("Total SKUs",             view_df["Item Name"].nunique())
+m5.metric("Weighted Avg Lead Time", f"{get_walt(lt_df):.1f} days" if not lt_df.empty else "N/A")
+m6.metric("Avg Fulfillment",        f"{get_fulfillment_pct(view_df):.1f}%")
 
 st.divider()
 
@@ -354,52 +417,56 @@ st.divider()
 c1, c2 = st.columns(2)
 
 with c1:
-    po_group = (
-        view_df.groupby("Purchase Order Number")
-        .apply(get_walt)
-        .reset_index(name="Weighted Lead Time (days)")
-    )
-    fig1 = px.bar(
-        po_group, x="Purchase Order Number", y="Weighted Lead Time (days)",
-        title="Weighted Lead Time per PO",
-        color="Weighted Lead Time (days)", color_continuous_scale="RdYlGn_r",
-    )
-    fig1.update_layout(xaxis_tickangle=-45)
-    st.plotly_chart(fig1, use_container_width=True)
+    if not lt_df.empty:
+        po_group = (
+            lt_df.groupby("Purchase Order Number")
+            .apply(get_walt)
+            .reset_index(name="Weighted Lead Time (days)")
+        )
+        fig1 = px.bar(
+            po_group, x="Purchase Order Number", y="Weighted Lead Time (days)",
+            title="Weighted Lead Time per PO (invoiced only)",
+            color="Weighted Lead Time (days)", color_continuous_scale="RdYlGn_r",
+        )
+        fig1.update_layout(xaxis_tickangle=-45)
+        st.plotly_chart(fig1, use_container_width=True)
+    else:
+        st.info("No invoiced POs in selection.")
 
 with c2:
-    item_group = (
-        view_df.groupby("Item Name Display")
-        .apply(get_walt)
-        .reset_index(name="Weighted Lead Time (days)")
-        .sort_values("Weighted Lead Time (days)", ascending=True)
-    )
-    fig2 = px.bar(
-        item_group, x="Weighted Lead Time (days)", y="Item Name Display",
-        orientation="h", title="Lead Time Efficiency by Item",
-        color="Weighted Lead Time (days)", color_continuous_scale="RdYlGn_r",
-    )
-    st.plotly_chart(fig2, use_container_width=True)
+    if not lt_df.empty:
+        item_group = (
+            lt_df.groupby("Item Name Display")
+            .apply(get_walt)
+            .reset_index(name="Weighted Lead Time (days)")
+            .sort_values("Weighted Lead Time (days)", ascending=True)
+        )
+        fig2 = px.bar(
+            item_group, x="Weighted Lead Time (days)", y="Item Name Display",
+            orientation="h", title="Lead Time Efficiency by Item (invoiced only)",
+            color="Weighted Lead Time (days)", color_continuous_scale="RdYlGn_r",
+        )
+        st.plotly_chart(fig2, use_container_width=True)
 
 if vendor_choice == "All Vendors":
     st.subheader("Vendor Comparison")
     vc1, vc2 = st.columns(2)
     with vc1:
         vendor_group = (
-            view_df.groupby("Vendor Name")
+            lt_df.groupby("Vendor Name")
             .apply(get_walt)
             .reset_index(name="Weighted Lead Time (days)")
         )
         fig3 = px.bar(
             vendor_group, x="Vendor Name", y="Weighted Lead Time (days)",
-            title="Weighted Lead Time by Vendor", color="Vendor Name",
+            title="Weighted Lead Time by Vendor (invoiced only)", color="Vendor Name",
         )
         st.plotly_chart(fig3, use_container_width=True)
     with vc2:
         vf_group = (
             view_df.drop_duplicates(subset=["Purchase Order Number", "Item Name", "Vendor Name"])
             .groupby("Vendor Name")
-            .apply(lambda d: (d["Total_Inv_Qty"].sum() / d["QuantityOrdered"].sum() * 100)
+            .apply(lambda d: (d["Total_Inv_Qty"].fillna(0).sum() / d["QuantityOrdered"].sum() * 100)
                              if d["QuantityOrdered"].sum() > 0 else 0)
             .reset_index(name="Fulfillment %")
         )
@@ -418,14 +485,14 @@ with fc1:
     po_ful = (
         view_df.drop_duplicates(subset=["Purchase Order Number", "Item Name"])
         .groupby("Purchase Order Number")
-        .apply(lambda d: (d["Total_Inv_Qty"].sum() / d["QuantityOrdered"].sum() * 100)
+        .apply(lambda d: (d["Total_Inv_Qty"].fillna(0).sum() / d["QuantityOrdered"].sum() * 100)
                          if d["QuantityOrdered"].sum() > 0 else 0)
         .reset_index(name="Fulfillment %")
         .sort_values("Fulfillment %")
     )
     fig_pof = px.bar(
         po_ful, x="Fulfillment %", y="Purchase Order Number",
-        orientation="h", title="Fulfillment % per PO",
+        orientation="h", title="Fulfillment % per PO (0% = yet to supply)",
         color="Fulfillment %", color_continuous_scale="RdYlGn",
         range_x=[0, 110],
     )
@@ -436,14 +503,14 @@ with fc2:
     item_ful = (
         view_df.drop_duplicates(subset=["Purchase Order Number", "Item Name"])
         .groupby("Item Name Display")
-        .apply(lambda d: (d["Total_Inv_Qty"].sum() / d["QuantityOrdered"].sum() * 100)
+        .apply(lambda d: (d["Total_Inv_Qty"].fillna(0).sum() / d["QuantityOrdered"].sum() * 100)
                          if d["QuantityOrdered"].sum() > 0 else 0)
         .reset_index(name="Fulfillment %")
         .sort_values("Fulfillment %")
     )
     fig_itf = px.bar(
         item_ful, x="Fulfillment %", y="Item Name Display",
-        orientation="h", title="Fulfillment % by Item",
+        orientation="h", title="Fulfillment % by Item (includes pending)",
         color="Fulfillment %", color_continuous_scale="RdYlGn",
         range_x=[0, 110],
     )
@@ -455,6 +522,7 @@ with fc2:
 st.subheader("📋 Fulfillment Record")
 
 display_cols = {
+    "Supply_Status":         "Status",
     "Purchase Order Number": "PO Number",
     "Invoice_Number":        "Invoice Number",
     "Purchase Order Date":   "PO Date",
@@ -471,23 +539,31 @@ display_cols = {
 
 table_df = view_df[list(display_cols.keys())].rename(columns=display_cols).copy()
 table_df["PO Date"]   = table_df["PO Date"].dt.strftime("%d-%b-%Y")
-table_df["Bill Date"] = table_df["Bill Date"].dt.strftime("%d-%b-%Y")
+table_df["Bill Date"] = table_df["Bill Date"].apply(
+    lambda x: x.strftime("%d-%b-%Y") if pd.notna(x) else "—"
+)
 table_df["PO Value (₹)"] = table_df["PO Value (₹)"].apply(
     lambda x: f"₹{x:,.0f}" if pd.notna(x) else "-"
 )
 table_df["Fulfillment %"] = table_df["Fulfillment %"].apply(
-    lambda x: f"{x:.1f}%" if pd.notna(x) else "-"
+    lambda x: f"{x:.1f}%" if pd.notna(x) else "0.0%"
 )
+table_df["This Invoice Qty"] = table_df["This Invoice Qty"].apply(
+    lambda x: x if pd.notna(x) and x > 0 else "—"
+)
+table_df["Lead Time (days)"] = table_df["Lead Time (days)"].apply(
+    lambda x: int(x) if pd.notna(x) else "—"
+)
+table_df = table_df.sort_values(["Status", "PO Number"], ascending=[True, True])
 
 st.dataframe(
     table_df,
     use_container_width=True,
     column_config={
-        "Fulfillment %": st.column_config.TextColumn("Fulfillment %"),
-        "PO Qty":          st.column_config.NumberColumn("PO Qty",          format="%d"),
+        "Status":             st.column_config.TextColumn("Status", width="medium"),
+        "Fulfillment %":      st.column_config.TextColumn("Fulfillment %"),
+        "PO Qty":             st.column_config.NumberColumn("PO Qty", format="%d"),
         "Total Invoiced Qty": st.column_config.NumberColumn("Total Invoiced Qty", format="%.1f"),
-        "This Invoice Qty":   st.column_config.NumberColumn("This Invoice Qty",   format="%.1f"),
-        "Lead Time (days)":   st.column_config.NumberColumn("Lead Time (days)",   format="%d"),
     },
 )
 
@@ -507,7 +583,7 @@ all_pos = sorted(all_df["Purchase Order Number"].dropna().unique().tolist())
 pos_to_remove = st.multiselect("Select PO(s) to remove", options=all_pos, placeholder="Choose PO numbers…")
 
 if pos_to_remove:
-    affected = f_df[f_df["Purchase Order Number"].isin(pos_to_remove)]
+    affected = all_df[all_df["Purchase Order Number"].isin(pos_to_remove)]
     st.warning(
         f"This will remove **{len(affected)} record(s)** across "
         f"**{affected['Item Name Display'].nunique()} SKU(s)** "
@@ -532,12 +608,12 @@ if pos_to_remove:
 st.sidebar.divider()
 col_r1, col_r2 = st.sidebar.columns(2)
 with col_r1:
-    if st.button("🗑️ Reset Data", key="reset_data"):
+    if st.sidebar.button("🗑️ Reset Data", key="reset_data"):
         if os.path.exists(DB_FILE):
             os.remove(DB_FILE)
         st.rerun()
 with col_r2:
-    if st.button("↩️ Reset Vendors", key="reset_vendors"):
+    if st.sidebar.button("↩️ Reset Vendors", key="reset_vendors"):
         if os.path.exists(VENDORS_FILE):
             os.remove(VENDORS_FILE)
         st.rerun()
