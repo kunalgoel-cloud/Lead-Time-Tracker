@@ -51,7 +51,19 @@ if st.sidebar.button("Process & Update Data"):
         df_po["Item Name"]             = df_po["Item Name"].str.strip().str.lower()
         df_po["Item Total"]            = pd.to_numeric(df_po["Item Total"],      errors="coerce")
         df_po["QuantityOrdered"]       = pd.to_numeric(df_po["QuantityOrdered"], errors="coerce")
-        po_db = df_po.drop_duplicates()
+        # Collapse duplicates within the uploaded file on natural key
+        df_po = df_po.drop_duplicates(subset=["Purchase Order Number", "Item Name"], keep="last")
+        if not po_db.empty:
+            existing_keys_po = set(zip(
+                po_db["Purchase Order Number"].astype(str),
+                po_db["Item Name"].astype(str),
+            ))
+            mask_new_po = ~df_po.apply(
+                lambda r: (str(r["Purchase Order Number"]), str(r["Item Name"])) in existing_keys_po, axis=1
+            )
+            po_db = pd.concat([po_db, df_po[mask_new_po]], ignore_index=True)
+        else:
+            po_db = df_po
 
     # TWO FILE TYPES:
     #
@@ -102,19 +114,98 @@ if st.sidebar.button("Process & Update Data"):
                 b2["Item_Name_Bill"] = temp["Item Name"].str.strip().str.lower()
                 b2["Inv_Qty"]        = pd.to_numeric(temp["Quantity"],   errors="coerce")
                 b2["Bill_Amount"]    = pd.to_numeric(temp["Item Total"], errors="coerce")
+                # Drop rows with no item name — they cannot be matched to a PO line
+                b2 = b2[b2["Item_Name_Bill"].notna() & (b2["Item_Name_Bill"] != "nan") & (b2["Item_Name_Bill"] != "")]
                 new_b2_list.append(b2)
 
+    # ── Upsert: new rows only, existing DB records are never dropped ────────
+    #
+    # Natural keys (decide uniqueness):
+    #   PO master        →  Purchase Order Number  +  Item Name
+    #   Bills_Header(b1) →  Invoice_Number         +  Vendor Name
+    #   Bills_Lines (b2) →  Invoice_Number         +  Vendor Name  +  Item_Name_Bill
+    #
+    # Rules:
+    #   1. Collapse any within-file duplicates on the natural key (keep last).
+    #   2. Compare incoming rows against the existing DB on the natural key.
+    #   3. Rows whose key already exists in the DB are SKIPPED — existing wins.
+    #   4. Only genuinely new rows are appended to the DB.
+    #   5. Existing DB rows that are NOT in the upload are KEPT untouched.
+
+    def upsert(existing: pd.DataFrame, incoming: pd.DataFrame, key_cols: list):
+        """Append rows from incoming that don't already exist in DB by natural key."""
+        # Step 1 — within-upload dedup
+        incoming = incoming.drop_duplicates(subset=key_cols, keep="last")
+        if existing.empty:
+            return incoming, len(incoming), 0
+        # Step 2 — build existing key set (use fillna to handle NaN safely)
+        existing_keys = set(
+            zip(*[existing[c].astype(str).fillna("__null__") for c in key_cols])
+        )
+        # Step 3 — flag new vs duplicate
+        is_dupe = incoming.apply(
+            lambda r: tuple(str(r[c]) if pd.notna(r[c]) else "__null__" for c in key_cols)
+                      in existing_keys,
+            axis=1,
+        )
+        new_rows = incoming[~is_dupe]
+        n_dupes  = int(is_dupe.sum())
+        # Step 4 — append only new rows; existing DB is preserved in full
+        merged = pd.concat([existing, new_rows], ignore_index=True)
+        return merged, len(new_rows), n_dupes
+
+    msgs = []
+
     if new_b1_list:
-        b1_db = pd.concat(new_b1_list, ignore_index=True).drop_duplicates()
+        incoming_b1 = pd.concat(new_b1_list, ignore_index=True)
+        b1_db, added, skipped = upsert(b1_db, incoming_b1, ["Invoice_Number", "Vendor Name"])
+        if skipped > 0 and added == 0:
+            msgs.append(f"📋 Bills Header: all {skipped} row(s) already in DB — nothing added.")
+        elif skipped > 0:
+            msgs.append(f"📋 Bills Header: **{added}** new row(s) added, **{skipped}** already existed (skipped).")
+        else:
+            msgs.append(f"📋 Bills Header: **{added}** new row(s) added.")
+
     if new_b2_list:
-        b2_db = pd.concat(new_b2_list, ignore_index=True).drop_duplicates()
+        incoming_b2 = pd.concat(new_b2_list, ignore_index=True)
+        b2_db, added, skipped = upsert(b2_db, incoming_b2, ["Invoice_Number", "Vendor Name", "Item_Name_Bill"])
+        if skipped > 0 and added == 0:
+            msgs.append(f"🧾 Bills Lines: all {skipped} row(s) already in DB — nothing added.")
+        elif skipped > 0:
+            msgs.append(f"🧾 Bills Lines: **{added}** new row(s) added, **{skipped}** already existed (skipped).")
+        else:
+            msgs.append(f"🧾 Bills Lines: **{added}** new row(s) added.")
+
+    if po_file:
+        incoming_po = po_db if po_db.empty else po_db  # po_db already set above
+        # Re-load the original parsed df_po and upsert against the pre-existing DB
+        # po_db was already replaced in the po_file block above — reload DB snapshot
+        po_db_snap, _, _ = load_db()
+        po_db_existing = po_db_snap if not po_db_snap.empty else pd.DataFrame()
+        # incoming_po is whatever was just parsed from the file
+        # We need to redo the merge properly: use the parsed df_po vs pre-upload po_db
+        # Since po_db was already overwritten above, use it as incoming and po_db_snap as base
+        if not po_db_existing.empty:
+            po_db_existing["Item Name"]             = po_db_existing["Item Name"].astype(str).str.strip().str.lower()
+            po_db_existing["Purchase Order Number"] = po_db_existing["Purchase Order Number"].astype(str).str.strip()
+            po_db, added_po, skipped_po = upsert(po_db_existing, po_db, ["Purchase Order Number", "Item Name"])
+            if skipped_po > 0 and added_po == 0:
+                msgs.append(f"📦 POs: all {skipped_po} row(s) already in DB — nothing added.")
+            elif skipped_po > 0:
+                msgs.append(f"📦 POs: **{added_po}** new row(s) added, **{skipped_po}** already existed (skipped).")
+            else:
+                msgs.append(f"📦 POs: **{added_po}** new row(s) added.")
+        else:
+            msgs.append(f"📦 POs: **{len(po_db)}** row(s) loaded (first import).")
 
     if not po_db.empty and not b1_db.empty and not b2_db.empty:
         with pd.ExcelWriter(DB_FILE, engine="openpyxl") as writer:
             po_db.to_excel(writer, sheet_name="POs",          index=False)
             b1_db.to_excel(writer, sheet_name="Bills_Header", index=False)
             b2_db.to_excel(writer, sheet_name="Bills_Lines",  index=False)
-        st.sidebar.success("✅ Database rebuilt successfully!")
+        st.sidebar.success("✅ Database updated!")
+        for m in msgs:
+            st.sidebar.info(m)
         st.rerun()
     else:
         st.sidebar.warning("⚠️ Could not find all required file types. Check uploads.")
