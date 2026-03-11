@@ -2,69 +2,91 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-# --- APP CONFIG ---
-st.set_page_config(page_title="Supplier Lead Time Tracker", layout="wide")
-st.title("📦 Supplier Lead Time Analytics")
+st.set_page_config(page_title="PO & Bill Tracker", layout="wide")
 
-# --- MOCK DATA GENERATOR (Replace with st.file_uploader for your CSVs) ---
-@st.cache_data
-def load_data():
-    # Example PO Data
-    po_data = pd.DataFrame({
-        'PO_Number': ['PO-001', 'PO-002', 'PO-003'],
-        'Vendor': ['Acme Corp', 'Globex', 'Acme Corp'],
-        'Order_Date': pd.to_datetime(['2024-01-01', '2024-01-05', '2024-01-10']),
-        'Total_Value': [1000, 5000, 2000]
-    })
+# --- INITIALIZE DATABASE ---
+if 'po_db' not in st.session_state:
+    st.session_state.po_db = pd.DataFrame(columns=['PO_Number', 'Vendor', 'Order_Date', 'Total_Value'])
+if 'bill_db' not in st.session_state:
+    st.session_state.bill_db = pd.DataFrame(columns=['PO_Number', 'Item', 'Invoice_Date', 'Qty'])
+
+# --- HELPER FUNCTIONS ---
+def add_po(number, vendor, date, value):
+    if number not in st.session_state.po_db['PO_Number'].values:
+        new_row = pd.DataFrame([[number, vendor, date, value]], columns=st.session_state.po_db.columns)
+        st.session_state.po_db = pd.concat([st.session_state.po_db, new_row], ignore_index=True)
+        st.success(f"PO {number} added!")
+    else:
+        st.warning("PO Number already exists.")
+
+def add_bill(po_num, item, date, qty):
+    # Check for exact duplicate bill entry
+    duplicate = st.session_state.bill_db[(st.session_state.bill_db['PO_Number'] == po_num) & 
+                                        (st.session_state.bill_db['Item'] == item) & 
+                                        (st.session_state.bill_db['Invoice_Date'] == pd.to_datetime(date))]
+    if duplicate.empty:
+        new_row = pd.DataFrame([[po_num, item, pd.to_datetime(date), qty]], columns=st.session_state.bill_db.columns)
+        st.session_state.bill_db = pd.concat([st.session_state.bill_db, new_row], ignore_index=True)
+        st.success("Bill added!")
+    else:
+        st.warning("This specific bill entry already exists.")
+
+# --- SIDEBAR: DATA ENTRY ---
+st.sidebar.header("📝 Data Entry")
+
+menu = st.sidebar.radio("Action", ["Add PO", "Add Bill", "Manage/Delete Data"])
+
+if menu == "Add PO":
+    with st.sidebar.form("po_form"):
+        po_num = st.text_input("PO Number")
+        vendor = st.text_input("Vendor Name")
+        order_date = st.date_input("Order Date")
+        val = st.number_input("Total Value", min_value=0)
+        if st.form_submit_button("Submit PO"):
+            add_po(po_num, vendor, pd.to_datetime(order_date), val)
+
+elif menu == "Add Bill":
+    with st.sidebar.form("bill_form"):
+        po_ref = st.selectbox("Select PO Reference", st.session_state.po_db['PO_Number'].unique())
+        item_name = st.text_input("Item Name")
+        inv_date = st.date_input("Invoice Date")
+        qty = st.number_input("Quantity", min_value=1)
+        if st.form_submit_button("Submit Bill"):
+            add_bill(po_ref, item_name, inv_date, qty)
+
+elif menu == "Manage/Delete Data":
+    st.sidebar.subheader("Delete Entries")
+    if not st.session_state.po_db.empty:
+        po_to_del = st.sidebar.selectbox("Delete PO", st.session_state.po_db['PO_Number'])
+        if st.sidebar.button("Confirm Delete PO"):
+            st.session_state.po_db = st.session_state.po_db[st.session_state.po_db['PO_Number'] != po_to_del]
+            st.session_state.bill_db = st.session_state.bill_db[st.session_state.bill_db['PO_Number'] != po_to_del]
+            st.rerun()
+
+# --- MAIN DASHBOARD ---
+st.title("📊 Supply Chain Lead Time Dashboard")
+
+if st.session_state.po_db.empty or st.session_state.bill_db.empty:
+    st.info("Please add at least one PO and one Bill to see analytics.")
+else:
+    # JOIN DATA
+    df = pd.merge(st.session_state.bill_db, st.session_state.po_db, on="PO_Number")
+    df['Lead_Time'] = (df['Invoice_Date'] - df['Order_Date']).dt.days
+
+    # VENDOR DROPDOWN
+    vendors = df['Vendor'].unique()
+    selected_v = st.selectbox("Filter by Vendor", vendors)
+    v_df = df[df['Vendor'] == selected_v]
+
+    # OUTPUTS
+    c1, c2 = st.columns(2)
+    with c1:
+        avg_po = v_df.groupby('PO_Number')['Lead_Time'].mean().reset_index()
+        st.plotly_chart(px.bar(avg_po, x='PO_Number', y='Lead_Time', title="Avg Lead Time per PO"), use_container_width=True)
     
-    # Example Bill/Invoice Data
-    bill_data = pd.DataFrame({
-        'PO_Number': ['PO-001', 'PO-002', 'PO-002', 'PO-003'],
-        'Item': ['Widget A', 'Gadget B', 'Gadget B', 'Widget A'],
-        'Invoice_Date': pd.to_datetime(['2024-01-10', '2024-01-20', '2024-01-25', '2024-01-15']),
-        'Qty': [10, 50, 50, 20]
-    })
-    return po_data, bill_data
+    with c2:
+        avg_item = v_df.groupby('Item')['Lead_Time'].mean().reset_index()
+        st.plotly_chart(px.bar(avg_item, x='Item', y='Lead_Time', title="Avg Lead Time by Item"), use_container_width=True)
 
-po_df, bill_df = load_data()
-
-# --- DATA PROCESSING ---
-# Join Bills to POs
-merged_df = pd.merge(bill_df, po_df, on="PO_Number")
-
-# Calculate Lead Time (Days)
-merged_df['Lead_Time'] = (merged_df['Invoice_Date'] - merged_df['Order_Date']).dt.days
-
-# --- SIDEBAR FILTERS ---
-st.sidebar.header("Filters")
-vendor_list = po_df['Vendor'].unique()
-selected_vendor = st.sidebar.selectbox("Select Vendor", vendor_list)
-
-# Filter data based on selection
-filtered_df = merged_df[merged_df['Vendor'] == selected_vendor]
-
-# --- DASHBOARD LAYOUT ---
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader(f"Avg Lead Time: {selected_vendor}")
-    # Group by PO to show performance per order
-    po_avg = filtered_df.groupby('PO_Number')['Lead_Time'].mean().reset_index()
-    fig_po = px.bar(po_avg, x='PO_Number', y='Lead_Time', 
-                    labels={'Lead_Time': 'Days'}, title="Lead Time per Purchase Order")
-    st.plotly_chart(fig_po, use_container_width=True)
-
-with col2:
-    st.subheader("Lead Time by Item")
-    # Metric of average lead time of supplier by item
-    item_avg = filtered_df.groupby('Item')['Lead_Time'].mean().reset_index()
-    fig_item = px.bar(item_avg, x='Item', y='Lead_Time', 
-                      color='Lead_Time', color_continuous_scale='Reds',
-                      title="Avg Days to Deliver by SKU")
-    st.plotly_chart(fig_item, use_container_width=True)
-
-st.divider()
-
-# --- DATA VIEW ---
-st.subheader("Raw Fulfillment Data")
-st.dataframe(filtered_df[['PO_Number', 'Item', 'Order_Date', 'Invoice_Date', 'Lead_Time']], use_container_width=True)
+    st.subheader("Current Database View")
+    st.dataframe(v_df)
