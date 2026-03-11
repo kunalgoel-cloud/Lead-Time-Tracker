@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import os
+import re
 
 st.set_page_config(page_title="Weighted Lead Time Tracker", layout="wide")
 
@@ -9,125 +10,311 @@ st.set_page_config(page_title="Weighted Lead Time Tracker", layout="wide")
 TARGET_VENDORS = ["Candor Foods Pvt Ltd.", "Evergreen Foods and Snacks Pvt Ltd"]
 DB_FILE = "vendor_analytics_db.xlsx"
 
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+def clean_currency(series: pd.Series) -> pd.Series:
+    """Strip ₹ symbol, commas and whitespace then cast to float."""
+    return (
+        series.astype(str)
+        .str.replace(r"[₹,\s]", "", regex=True)
+        .pipe(pd.to_numeric, errors="coerce")
+    )
+
+
 def load_db():
     if os.path.exists(DB_FILE):
         try:
-            return pd.read_excel(DB_FILE, sheet_name="POs"), pd.read_excel(DB_FILE, sheet_name="Bills")
-        except:
-            return pd.DataFrame(), pd.DataFrame()
+            return (
+                pd.read_excel(DB_FILE, sheet_name="POs"),
+                pd.read_excel(DB_FILE, sheet_name="Bills"),
+            )
+        except Exception:
+            pass
     return pd.DataFrame(), pd.DataFrame()
+
 
 po_db, bill_db = load_db()
 
-# --- SIDEBAR: DATA UPLOAD ---
+# ── SIDEBAR: DATA UPLOAD ───────────────────────────────────────────────────────
 st.sidebar.header("📂 Data Management")
 po_file = st.sidebar.file_uploader("Upload Purchase Order CSV", type="csv")
-bill_files = st.sidebar.file_uploader("Upload Bill CSVs", type="csv", accept_multiple_files=True)
+bill_files = st.sidebar.file_uploader(
+    "Upload Bill CSVs", type="csv", accept_multiple_files=True
+)
 
 if st.sidebar.button("Process & Update Data"):
+    # ── 1. Process PO file ──────────────────────────────────────────────────
     if po_file:
         df_po = pd.read_csv(po_file)
-        df_po['Vendor Name'] = df_po['Vendor Name'].str.strip()
-        df_po = df_po[df_po['Vendor Name'].isin(TARGET_VENDORS)]
-        df_po['Purchase Order Date'] = pd.to_datetime(df_po['Purchase Order Date'], dayfirst=True, errors='coerce')
-        df_po['Purchase Order Number'] = df_po['Purchase Order Number'].astype(str).str.strip()
+        df_po["Vendor Name"] = df_po["Vendor Name"].str.strip()
+        df_po = df_po[df_po["Vendor Name"].isin(TARGET_VENDORS)].copy()
+        df_po["Purchase Order Date"] = pd.to_datetime(
+            df_po["Purchase Order Date"], dayfirst=True, errors="coerce"
+        )
+        df_po["Purchase Order Number"] = (
+            df_po["Purchase Order Number"].astype(str).str.strip()
+        )
+        df_po["Item Name"] = df_po["Item Name"].str.strip().str.lower()
+        df_po["Item Total"] = pd.to_numeric(df_po["Item Total"], errors="coerce")
+        df_po["QuantityOrdered"] = pd.to_numeric(
+            df_po["QuantityOrdered"], errors="coerce"
+        )
         po_db = df_po.drop_duplicates()
 
+    # ── 2. Process Bill files ───────────────────────────────────────────────
     all_bills = []
     if bill_files:
         for f in bill_files:
             temp = pd.read_csv(f)
-            
-            # 1. Identify PO Reference Column
-            ref_col = 'Reference Number' if 'Reference Number' in temp.columns else 'Reference Invoice Type'
-            if ref_col not in temp.columns: continue
-            
-            # 2. Extract Invoice Quantity (Specifically from Bill 2 pattern)
-            # We look for 'Quantity' first, then 'Qty'
-            actual_qty_col = None
-            if 'Quantity' in temp.columns: actual_qty_col = 'Quantity'
-            elif 'Qty' in temp.columns: actual_qty_col = 'Qty'
-            
-            # 3. Create Standardized Bill Record
-            std_bill = pd.DataFrame()
-            std_bill['PO_Ref'] = temp[ref_col].astype(str).str.strip()
-            std_bill['Bill_Date'] = pd.to_datetime(temp['Date'] if 'Date' in temp.columns else temp['Bill Date'], dayfirst=True, errors='coerce')
-            std_bill['Vendor Name'] = temp['Vendor Name'].str.strip()
-            std_bill['Item_Name_Bill'] = temp['Item Name'] if 'Item Name' in temp.columns else None
-            
-            if actual_qty_col:
-                std_bill['Inv_Qty'] = pd.to_numeric(temp[actual_qty_col], errors='coerce')
-            else:
-                std_bill['Inv_Qty'] = None # To be filled from PO for header bills
-            
-            std_bill = std_bill[std_bill['Vendor Name'].isin(TARGET_VENDORS)]
-            all_bills.append(std_bill)
-        
-        if all_bills:
-            bill_db = pd.concat(all_bills).drop_duplicates()
+            temp.columns = temp.columns.str.strip()
+            vendor_col = "Vendor Name" if "Vendor Name" in temp.columns else None
+            if vendor_col is None:
+                continue
+            temp[vendor_col] = temp[vendor_col].str.strip()
+            temp = temp[temp[vendor_col].isin(TARGET_VENDORS)].copy()
+            if temp.empty:
+                continue
 
-    with pd.ExcelWriter(DB_FILE) as writer:
-        po_db.to_excel(writer, sheet_name="POs", index=False)
-        bill_db.to_excel(writer, sheet_name="Bills", index=False)
-    st.sidebar.success("Database Rebuilt!")
-    st.rerun()
+            # ── Bills__1_ pattern: header-level, has Reference Number ──────
+            # Columns: BILL_ID, Date, Bill#, Vendor Name, Status, Amount,
+            #          Reference Number, Item Price
+            if "Reference Number" in temp.columns and "Date" in temp.columns and "BILL_ID" in temp.columns:
+                std = pd.DataFrame()
+                std["PO_Ref"] = (
+                    temp["Reference Number"].astype(str).str.strip()
+                )
+                std["Bill_Date"] = pd.to_datetime(
+                    temp["Date"], dayfirst=True, errors="coerce"
+                )
+                std["Vendor Name"] = temp[vendor_col]
+                std["Item_Name_Bill"] = None          # no item-level detail
+                std["Inv_Qty"] = None                 # will fall back to PO qty
+                std["Bill_Amount"] = clean_currency(temp["Amount"])
+                std = std[std["PO_Ref"].notna() & (std["PO_Ref"] != "nan")]
+                all_bills.append(std)
 
-# --- ANALYTICS ENGINE ---
+            # ── Bill__2_ pattern: item-level, no PO reference ─────────────
+            # Columns: Bill Date, Vendor Name, Bill Number, Account,
+            #          CF.Item Price, Reference Invoice Type, Item Name,
+            #          Item Total, Quantity
+            elif "Bill Date" in temp.columns and "Item Name" in temp.columns:
+                std = pd.DataFrame()
+                std["PO_Ref"] = None                  # no PO ref in this file
+                std["Bill_Date"] = pd.to_datetime(
+                    temp["Bill Date"], dayfirst=True, errors="coerce"
+                )
+                std["Vendor Name"] = temp[vendor_col]
+                std["Item_Name_Bill"] = (
+                    temp["Item Name"].str.strip().str.lower()
+                )
+                std["Inv_Qty"] = pd.to_numeric(
+                    temp["Quantity"], errors="coerce"
+                )
+                std["Bill_Amount"] = pd.to_numeric(
+                    temp["Item Total"], errors="coerce"
+                )
+                all_bills.append(std)
+
+    if all_bills:
+        bill_db = pd.concat(all_bills, ignore_index=True).drop_duplicates()
+
+    # ── Persist ─────────────────────────────────────────────────────────────
+    if not po_db.empty and not bill_db.empty:
+        with pd.ExcelWriter(DB_FILE, engine="openpyxl") as writer:
+            po_db.to_excel(writer, sheet_name="POs", index=False)
+            bill_db.to_excel(writer, sheet_name="Bills", index=False)
+        st.sidebar.success("✅ Database rebuilt successfully!")
+        st.rerun()
+    else:
+        st.sidebar.warning("⚠️ No matching vendor data found. Check your files.")
+
+# ── ANALYTICS ENGINE ───────────────────────────────────────────────────────────
 st.title("📊 Supplier Performance: Weighted Lead Time")
 
 if po_db.empty or bill_db.empty:
-    st.info("Upload your PO and Bill files and click 'Process' to see the metrics.")
-else:
-    # 1. MERGE LOGIC (Handling Item-level vs Header-level bills)
-    # Check if we have item-level info to merge on
-    if 'Item_Name_Bill' in bill_db.columns and bill_db['Item_Name_Bill'].notna().any():
-        item_bills = bill_db[bill_db['Item_Name_Bill'].notna()]
-        header_bills = bill_db[bill_db['Item_Name_Bill'].isna()]
-        
-        merged_items = pd.merge(item_bills, po_db, left_on=['PO_Ref', 'Item_Name_Bill'], 
-                                right_on=['Purchase Order Number', 'Item Name'], how='inner')
-        merged_headers = pd.merge(header_bills, po_db, left_on='PO_Ref', 
-                                  right_on='Purchase Order Number', how='inner')
-        f_df = pd.concat([merged_items, merged_headers])
-    else:
-        f_df = pd.merge(bill_db, po_db, left_on='PO_Ref', right_on='Purchase Order Number', how='inner')
+    st.info(
+        "Upload your PO and Bill files in the sidebar and click "
+        "**Process & Update Data** to see the metrics."
+    )
+    st.stop()
 
-    # 2. CALCULATIONS
-    f_df['Lead_Time'] = (f_df['Bill_Date'] - f_df['Purchase Order Date']).dt.days
-    f_df = f_df[f_df['Lead_Time'] >= 0]
-    
-    # Fill missing Invoice Qty with PO Qty (for Bills 1)
-    f_df['Inv_Qty_Final'] = f_df['Inv_Qty'].fillna(f_df['QuantityOrdered'])
-    f_df['W_Comp'] = f_df['Lead_Time'] * f_df['Inv_Qty_Final']
+# Normalise item names in po_db (in case loaded from Excel without lowercasing)
+po_db["Item Name"] = po_db["Item Name"].astype(str).str.strip().str.lower()
 
-    # 3. KPI CALCULATIONS
-    def get_walt(df):
-        total_q = df['Inv_Qty_Final'].sum()
-        return df['W_Comp'].sum() / total_q if total_q > 0 else 0
+# ── MERGE LOGIC ────────────────────────────────────────────────────────────────
+#
+#  Bills__1_  → has PO_Ref but no Item_Name_Bill
+#              → merge on PO_Ref + Vendor Name
+#              → use PO QuantityOrdered as invoice qty
+#
+#  Bill__2_   → has Item_Name_Bill but no PO_Ref
+#              → merge on Item_Name_Bill + Vendor Name (latest PO per item)
+#
 
-    m1, m2, m3 = st.columns(3)
-    unique_pos = f_df.drop_duplicates(subset=['Purchase Order Number', 'Item Name'])
-    m1.metric("Total Order Value", f"₹{unique_pos['Item Total'].sum():,.2f}")
-    m2.metric("Total POs", f_df['Purchase Order Number'].nunique())
-    m3.metric("Weighted Avg Lead Time", f"{get_walt(f_df):.1f} Days")
+ref_bills  = bill_db[bill_db["PO_Ref"].notna() & (bill_db["PO_Ref"] != "nan")].copy()
+item_bills = bill_db[bill_db["Item_Name_Bill"].notna()].copy()
 
-    # 4. VISUALS
-    c1, c2 = st.columns(2)
-    with c1:
-        po_group = f_df.groupby('Purchase Order Number').apply(get_walt).reset_index(name='WLT')
-        st.plotly_chart(px.bar(po_group, x='Purchase Order Number', y='WLT', title="Weighted LT per PO"), use_container_width=True)
-    with c2:
-        item_group = f_df.groupby('Item Name').apply(get_walt).reset_index(name='WLT')
-        st.plotly_chart(px.bar(item_group, x='WLT', y='Item Name', orientation='h', title="Efficiency by Item"), use_container_width=True)
+merged_parts = []
 
-    # 5. TABLE
-    st.subheader("Fulfillment Record")
-    st.dataframe(f_df[['Purchase Order Number', 'Purchase Order Date', 'Vendor Name_y', 'Item Name', 
-                       'QuantityOrdered', 'Inv_Qty_Final', 'Item Total', 'Bill_Date', 'Lead_Time']]
-                 .rename(columns={'Vendor Name_y': 'Vendor', 'QuantityOrdered': 'PO Qty', 
-                                  'Inv_Qty_Final': 'Invoice Qty', 'Item Total': 'Value'}), 
-                 use_container_width=True)
+# Part A: reference-based (Bills__1_)
+if not ref_bills.empty:
+    merged_a = pd.merge(
+        ref_bills,
+        po_db,
+        left_on=["PO_Ref", "Vendor Name"],
+        right_on=["Purchase Order Number", "Vendor Name"],
+        how="inner",
+    )
+    merged_parts.append(merged_a)
 
-if st.sidebar.button("🗑️ Reset All"):
-    if os.path.exists(DB_FILE): os.remove(DB_FILE)
+# Part B: item-name-based (Bill__2_)
+if not item_bills.empty:
+    merged_b = pd.merge(
+        item_bills,
+        po_db,
+        left_on=["Item_Name_Bill", "Vendor Name"],
+        right_on=["Item Name", "Vendor Name"],
+        how="inner",
+    )
+    merged_parts.append(merged_b)
+
+if not merged_parts:
+    st.warning("No matching records found between POs and Bills.")
+    st.stop()
+
+f_df = pd.concat(merged_parts, ignore_index=True)
+
+# ── CALCULATIONS ───────────────────────────────────────────────────────────────
+f_df["Lead_Time"] = (
+    f_df["Bill_Date"] - f_df["Purchase Order Date"]
+).dt.days
+f_df = f_df[f_df["Lead_Time"] >= 0].copy()
+
+# Invoice qty: use Inv_Qty if available, else fall back to PO QuantityOrdered
+f_df["Inv_Qty_Final"] = f_df["Inv_Qty"].fillna(f_df["QuantityOrdered"])
+f_df["W_Comp"] = f_df["Lead_Time"] * f_df["Inv_Qty_Final"]
+
+# Restore display-friendly item name
+f_df["Item Name Display"] = f_df["Item Name"].str.title()
+
+# ── KPI HELPER ─────────────────────────────────────────────────────────────────
+def get_walt(df: pd.DataFrame) -> float:
+    total_q = df["Inv_Qty_Final"].sum()
+    return df["W_Comp"].sum() / total_q if total_q > 0 else 0.0
+
+
+# ── VENDOR FILTER ──────────────────────────────────────────────────────────────
+vendor_choice = st.selectbox(
+    "Filter by Vendor", ["All Vendors"] + TARGET_VENDORS
+)
+view_df = f_df if vendor_choice == "All Vendors" else f_df[f_df["Vendor Name"] == vendor_choice]
+
+if view_df.empty:
+    st.warning("No data available for the selected vendor.")
+    st.stop()
+
+# ── KPI METRICS ────────────────────────────────────────────────────────────────
+m1, m2, m3, m4 = st.columns(4)
+unique_po_items = view_df.drop_duplicates(subset=["Purchase Order Number", "Item Name"])
+m1.metric("Total Order Value (₹)", f"₹{unique_po_items['Item Total'].sum():,.0f}")
+m2.metric("Total POs", view_df["Purchase Order Number"].nunique())
+m3.metric("Total SKUs", view_df["Item Name"].nunique())
+m4.metric("Weighted Avg Lead Time", f"{get_walt(view_df):.1f} days")
+
+st.divider()
+
+# ── CHARTS ─────────────────────────────────────────────────────────────────────
+c1, c2 = st.columns(2)
+
+with c1:
+    po_group = (
+        view_df.groupby("Purchase Order Number")
+        .apply(get_walt)
+        .reset_index(name="Weighted Lead Time (days)")
+    )
+    fig1 = px.bar(
+        po_group,
+        x="Purchase Order Number",
+        y="Weighted Lead Time (days)",
+        title="Weighted Lead Time per PO",
+        color="Weighted Lead Time (days)",
+        color_continuous_scale="RdYlGn_r",
+    )
+    fig1.update_layout(xaxis_tickangle=-45)
+    st.plotly_chart(fig1, use_container_width=True)
+
+with c2:
+    item_group = (
+        view_df.groupby("Item Name Display")
+        .apply(get_walt)
+        .reset_index(name="Weighted Lead Time (days)")
+        .sort_values("Weighted Lead Time (days)", ascending=True)
+    )
+    fig2 = px.bar(
+        item_group,
+        x="Weighted Lead Time (days)",
+        y="Item Name Display",
+        orientation="h",
+        title="Lead Time Efficiency by Item",
+        color="Weighted Lead Time (days)",
+        color_continuous_scale="RdYlGn_r",
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+# ── VENDOR COMPARISON (only when "All Vendors" selected) ──────────────────────
+if vendor_choice == "All Vendors":
+    st.subheader("Vendor Comparison")
+    vendor_group = (
+        f_df.groupby("Vendor Name")
+        .apply(get_walt)
+        .reset_index(name="Weighted Lead Time (days)")
+    )
+    fig3 = px.bar(
+        vendor_group,
+        x="Vendor Name",
+        y="Weighted Lead Time (days)",
+        title="Weighted Lead Time by Vendor",
+        color="Vendor Name",
+    )
+    st.plotly_chart(fig3, use_container_width=True)
+
+# ── FULFILLMENT TABLE ──────────────────────────────────────────────────────────
+st.subheader("📋 Fulfillment Record")
+
+display_cols = {
+    "Purchase Order Number": "PO Number",
+    "Purchase Order Date": "PO Date",
+    "Vendor Name": "Vendor",
+    "Item Name Display": "Item",
+    "QuantityOrdered": "PO Qty",
+    "Inv_Qty_Final": "Invoice Qty",
+    "Item Total": "PO Value (₹)",
+    "Bill_Date": "Bill Date",
+    "Lead_Time": "Lead Time (days)",
+}
+
+table_df = view_df[list(display_cols.keys())].rename(columns=display_cols).copy()
+table_df["PO Date"] = table_df["PO Date"].dt.strftime("%d-%b-%Y")
+table_df["Bill Date"] = table_df["Bill Date"].dt.strftime("%d-%b-%Y")
+table_df["PO Value (₹)"] = table_df["PO Value (₹)"].apply(
+    lambda x: f"₹{x:,.0f}" if pd.notna(x) else "-"
+)
+
+st.dataframe(table_df, use_container_width=True)
+
+# ── DOWNLOAD ───────────────────────────────────────────────────────────────────
+csv_bytes = table_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "⬇️ Download Fulfillment Report (CSV)",
+    data=csv_bytes,
+    file_name="fulfillment_report.csv",
+    mime="text/csv",
+)
+
+# ── RESET ──────────────────────────────────────────────────────────────────────
+st.sidebar.divider()
+if st.sidebar.button("🗑️ Reset All Data"):
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
     st.rerun()
