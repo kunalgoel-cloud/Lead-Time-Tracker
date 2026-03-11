@@ -140,7 +140,14 @@ if po_db.empty or bill_db.empty:
     st.stop()
 
 # Normalise item names in po_db (in case loaded from Excel without lowercasing)
+if "Item Name" not in po_db.columns:
+    st.warning("PO data is missing expected columns. Please re-upload and reprocess.")
+    st.stop()
 po_db["Item Name"] = po_db["Item Name"].astype(str).str.strip().str.lower()
+po_db["Purchase Order Date"] = pd.to_datetime(po_db["Purchase Order Date"], errors="coerce")
+
+# Ensure bill_db Bill_Date is datetime after Excel reload
+bill_db["Bill_Date"] = pd.to_datetime(bill_db["Bill_Date"], errors="coerce")
 
 # ── MERGE LOGIC ────────────────────────────────────────────────────────────────
 #
@@ -152,7 +159,12 @@ po_db["Item Name"] = po_db["Item Name"].astype(str).str.strip().str.lower()
 #              → merge on Item_Name_Bill + Vendor Name (latest PO per item)
 #
 
-ref_bills  = bill_db[bill_db["PO_Ref"].notna() & (bill_db["PO_Ref"] != "nan")].copy()
+# Ensure expected columns exist (they may be absent if loaded from an older Excel snapshot)
+for col in ["PO_Ref", "Item_Name_Bill", "Inv_Qty", "Bill_Amount", "Vendor Name", "Bill_Date"]:
+    if col not in bill_db.columns:
+        bill_db[col] = None
+
+ref_bills  = bill_db[bill_db["PO_Ref"].notna() & (bill_db["PO_Ref"].astype(str) != "nan")].copy()
 item_bills = bill_db[bill_db["Item_Name_Bill"].notna()].copy()
 
 merged_parts = []
