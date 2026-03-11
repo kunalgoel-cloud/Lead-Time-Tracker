@@ -3,9 +3,9 @@ import pandas as pd
 import plotly.express as px
 import os
 
-st.set_page_config(page_title="Advanced Vendor Analytics", layout="wide")
+st.set_page_config(page_title="Vendor Performance Dashboard", layout="wide")
 
-# --- CONFIG & CONSTANTS ---
+# --- CONFIG ---
 TARGET_VENDORS = ["Candor Foods Pvt Ltd.", "Evergreen Foods and Snacks Pvt Ltd"]
 DB_FILE = "vendor_analytics_db.xlsx"
 
@@ -19,7 +19,7 @@ def load_data():
 
 po_db, bill_db = load_data()
 
-# --- SIDEBAR: DATA MANAGEMENT ---
+# --- SIDEBAR: UPLOADS ---
 st.sidebar.header("📂 Data Management")
 po_file = st.sidebar.file_uploader("Upload Purchase Order CSV", type="csv")
 bill_files = st.sidebar.file_uploader("Upload Bill CSVs", type="csv", accept_multiple_files=True)
@@ -30,14 +30,12 @@ if st.sidebar.button("Process & Save Data"):
         df_po = df_po[df_po['Vendor Name'].str.strip().isin(TARGET_VENDORS)]
         df_po['Purchase Order Date'] = pd.to_datetime(df_po['Purchase Order Date'], dayfirst=True)
         df_po['Purchase Order Number'] = df_po['Purchase Order Number'].astype(str).str.strip()
-        df_po['Item Total'] = pd.to_numeric(df_po['Item Total'], errors='coerce').fillna(0)
         po_db = df_po.drop_duplicates()
 
     bill_list = []
     if bill_files:
         for f in bill_files:
             temp_df = pd.read_csv(f)
-            # Standardize based on user file structures
             if 'Reference Number' in temp_df.columns: 
                 temp_df = temp_df.rename(columns={'Reference Number': 'PO_Ref', 'Date': 'Bill_Date'})
             elif 'Reference Invoice Type' in temp_df.columns: 
@@ -58,85 +56,69 @@ if st.sidebar.button("Process & Save Data"):
     st.rerun()
 
 # --- ANALYTICS ENGINE ---
-st.title("📊 Supplier Performance & Spend Dashboard")
+st.title("📊 Supplier Lead Time & Value Tracker")
 
 if po_db.empty or bill_db.empty:
-    st.info("Please upload your PO and Bill files to begin.")
+    st.info("Please upload data to view the dashboard.")
 else:
-    # 1. CORE DATA MERGE
+    # 1. MERGE & CLEAN
     merged = pd.merge(bill_db, po_db, left_on='PO_Ref', right_on='Purchase Order Number', how='inner')
     merged['Lead_Time'] = (merged['Bill_Date'] - merged['Purchase Order Date']).dt.days
     merged = merged[merged['Lead_Time'] >= 0] 
 
-    # Identify the correct item and vendor columns (suffixes from merge)
-    item_col = 'Item Name_y' if 'Item Name_y' in merged.columns else 'Item Name'
-    vendor_col = 'Vendor Name_y' if 'Vendor Name_y' in merged.columns else 'Vendor Name'
+    # DYNAMIC COLUMN MAPPING (Handles suffixes like _x or _y)
+    def get_col(base_name, df):
+        if f"{base_name}_y" in df.columns: return f"{base_name}_y"
+        if f"{base_name}_x" in df.columns: return f"{base_name}_x"
+        return base_name
 
-    # 2. SIDEBAR FILTERS
+    item_col = get_col('Item Name', merged)
+    vendor_col = get_col('Vendor Name', merged)
+    val_col = get_col('Item Total', merged)
+    qty_col = get_col('QuantityOrdered', merged)
+
+    # 2. FILTERS
     st.sidebar.divider()
-    st.sidebar.header("🔍 Filter Selection")
-    
-    # Vendor
-    v_list = sorted(merged[vendor_col].unique().tolist())
-    vendor_choice = st.sidebar.selectbox("Vendor Name", ["All Vendors"] + v_list)
+    vendor_choice = st.sidebar.selectbox("Filter Vendor", ["All"] + sorted(merged[vendor_col].unique().tolist()))
     f_df = merged.copy()
-    if vendor_choice != "All Vendors":
+    if vendor_choice != "All":
         f_df = f_df[f_df[vendor_col] == vendor_choice]
 
-    # Time Filter
-    min_d = f_df['Purchase Order Date'].min().date()
-    max_d = f_df['Purchase Order Date'].max().date()
-    dr = st.sidebar.date_input("PO Date Range", [min_d, max_d])
+    dr = st.sidebar.date_input("PO Date Range", [f_df['Purchase Order Date'].min(), f_df['Purchase Order Date'].max()])
     if len(dr) == 2:
-        f_df = f_df[(f_df['Purchase Order Date'].dt.date >= dr[0]) & 
-                    (f_df['Purchase Order Date'].dt.date <= dr[1])]
+        f_df = f_df[(f_df['Purchase Order Date'].dt.date >= dr[0]) & (f_df['Purchase Order Date'].dt.date <= dr[1])]
 
-    # PO Number
-    po_list = ["All POs"] + sorted(f_df['Purchase Order Number'].unique().tolist())
-    selected_po = st.sidebar.selectbox("PO Number", po_list)
-    if selected_po != "All POs":
+    selected_po = st.sidebar.selectbox("Filter PO", ["All"] + sorted(f_df['Purchase Order Number'].unique().tolist()))
+    if selected_po != "All":
         f_df = f_df[f_df['Purchase Order Number'] == selected_po]
 
-    # Item Name
-    it_list = ["All Items"] + sorted(f_df[item_col].unique().tolist())
-    selected_item = st.sidebar.selectbox("Item Name", it_list)
-    if selected_item != "All Items":
+    selected_item = st.sidebar.selectbox("Filter Item", ["All"] + sorted(f_df[item_col].unique().tolist()))
+    if selected_item != "All":
         f_df = f_df[f_df[item_col] == selected_item]
 
-    # 3. KPI METRICS (Top of Page)
-    # Using drop_duplicates on the filtered df to avoid over-counting values per PO
-    unique_pos = f_df.drop_duplicates(subset=['Purchase Order Number', item_col])
+    # 3. TOP METRICS
+    # Deduplicate to get accurate PO totals
+    unique_entries = f_df.drop_duplicates(subset=['Purchase Order Number', item_col])
     
     m1, m2, m3 = st.columns(3)
-    total_val = unique_pos['Item Total'].sum()
-    num_pos = unique_pos['Purchase Order Number'].nunique()
-    avg_lt = f_df['Lead_Time'].mean()
+    m1.metric("Total PO Value", f"₹{unique_entries[val_col].sum():,.2f}")
+    m2.metric("Total POs", f_df['Purchase Order Number'].nunique())
+    m3.metric("Avg Lead Time", f"{f_df['Lead_Time'].mean():.1f} Days")
 
-    m1.metric("Total Order Value", f"₹{total_val:,.2f}")
-    m2.metric("Total POs Count", f"{num_pos}")
-    m3.metric("Avg Lead Time", f"{avg_lt:.1f} Days")
-
-    # 4. VISUALIZATIONS
+    # 4. CHARTS
     c1, c2 = st.columns(2)
     with c1:
         po_chart = f_df.groupby('Purchase Order Number')['Lead_Time'].mean().reset_index()
-        st.plotly_chart(px.bar(po_chart, x='Purchase Order Number', y='Lead_Time', 
-                              title="Lead Time per PO (Days)", color_discrete_sequence=['#00CC96']), use_container_width=True)
+        st.plotly_chart(px.bar(po_chart, x='Purchase Order Number', y='Lead_Time', title="Avg Lead Time per PO"), use_container_width=True)
     with c2:
         item_chart = f_df.groupby(item_col)['Lead_Time'].mean().reset_index()
-        st.plotly_chart(px.bar(item_chart, y=item_col, x='Lead_Time', orientation='h', 
-                              title="Efficiency by Item", color='Lead_Time', color_continuous_scale='Bluered'), use_container_width=True)
+        st.plotly_chart(px.bar(item_chart, x='Lead_Time', y=item_col, orientation='h', title="Avg Lead Time by Item"), use_container_width=True)
 
-    # 5. DETAILED TABLE
-    st.subheader("📋 fulfillment Tracking Table")
-    # Display columns matching your request
-    display_cols = [
-        'Purchase Order Number', 'Purchase Order Date', vendor_col, 
-        item_col, 'QuantityOrdered', 'Item Total', 'Bill_Date', 'Lead_Time'
-    ]
-    st.dataframe(f_df[display_cols].rename(columns={vendor_col: 'Vendor', item_col: 'Item Name'}), use_container_width=True)
+    # 5. TABLE
+    st.subheader("Data Detail View")
+    final_table = f_df[['Purchase Order Number', 'Purchase Order Date', vendor_col, item_col, qty_col, val_col, 'Bill_Date', 'Lead_Time']]
+    st.dataframe(final_table.rename(columns={vendor_col: 'Vendor', item_col: 'Item', val_col: 'Value', qty_col: 'Qty'}), use_container_width=True)
 
 if st.sidebar.button("🗑️ Reset Database"):
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
+    if os.path.exists(DB_FILE): os.remove(DB_FILE)
     st.rerun()
