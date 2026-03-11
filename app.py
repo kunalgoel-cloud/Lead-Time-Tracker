@@ -503,7 +503,7 @@ st.divider()
 st.subheader("🗑️ Remove PO Data")
 st.caption("Select one or more POs to permanently delete all their records from the database.")
 
-all_pos = sorted(f_df["Purchase Order Number"].dropna().unique().tolist())
+all_pos = sorted(all_df["Purchase Order Number"].dropna().unique().tolist())
 pos_to_remove = st.multiselect("Select PO(s) to remove", options=all_pos, placeholder="Choose PO numbers…")
 
 if pos_to_remove:
@@ -530,7 +530,14 @@ if pos_to_remove:
 
 # ── RESET ─────────────────────────────────────────────────────────────────────
 st.sidebar.divider()
-if st.sidebar.button("🗑️ Reset All Data"):
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
-    st.rerun()
+col_r1, col_r2 = st.sidebar.columns(2)
+with col_r1:
+    if st.button("🗑️ Reset Data", key="reset_data"):
+        if os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
+        st.rerun()
+with col_r2:
+    if st.button("↩️ Reset Vendors", key="reset_vendors"):
+        if os.path.exists(VENDORS_FILE):
+            os.remove(VENDORS_FILE)
+        st.rerun()
