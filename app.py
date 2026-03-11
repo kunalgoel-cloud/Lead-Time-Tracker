@@ -1,92 +1,93 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import os
 
-st.set_page_config(page_title="PO & Bill Tracker", layout="wide")
+st.set_page_config(page_title="Lead Time Tracker", layout="wide")
 
-# --- INITIALIZE DATABASE ---
-if 'po_db' not in st.session_state:
-    st.session_state.po_db = pd.DataFrame(columns=['PO_Number', 'Vendor', 'Order_Date', 'Total_Value'])
-if 'bill_db' not in st.session_state:
-    st.session_state.bill_db = pd.DataFrame(columns=['PO_Number', 'Item', 'Invoice_Date', 'Qty'])
+DB_FILE = "supplier_data.xlsx"
 
-# --- HELPER FUNCTIONS ---
-def add_po(number, vendor, date, value):
-    if number not in st.session_state.po_db['PO_Number'].values:
-        new_row = pd.DataFrame([[number, vendor, date, value]], columns=st.session_state.po_db.columns)
-        st.session_state.po_db = pd.concat([st.session_state.po_db, new_row], ignore_index=True)
-        st.success(f"PO {number} added!")
-    else:
-        st.warning("PO Number already exists.")
+# --- DATABASE ENGINE ---
+def load_db():
+    if os.path.exists(DB_FILE):
+        pos = pd.read_excel(DB_FILE, sheet_name="POs")
+        bills = pd.read_excel(DB_FILE, sheet_name="Bills")
+        return pos, bills
+    return pd.DataFrame(columns=['PO_Number', 'Vendor', 'Order_Date', 'Total_Value']), \
+           pd.DataFrame(columns=['PO_Number', 'Item', 'Invoice_Date', 'Qty', 'Value'])
 
-def add_bill(po_num, item, date, qty):
-    # Check for exact duplicate bill entry
-    duplicate = st.session_state.bill_db[(st.session_state.bill_db['PO_Number'] == po_num) & 
-                                        (st.session_state.bill_db['Item'] == item) & 
-                                        (st.session_state.bill_db['Invoice_Date'] == pd.to_datetime(date))]
-    if duplicate.empty:
-        new_row = pd.DataFrame([[po_num, item, pd.to_datetime(date), qty]], columns=st.session_state.bill_db.columns)
-        st.session_state.bill_db = pd.concat([st.session_state.bill_db, new_row], ignore_index=True)
-        st.success("Bill added!")
-    else:
-        st.warning("This specific bill entry already exists.")
+def save_db(po_df, bill_df):
+    with pd.ExcelWriter(DB_FILE) as writer:
+        po_df.to_excel(writer, sheet_name="POs", index=False)
+        bill_df.to_excel(writer, sheet_name="Bills", index=False)
 
-# --- SIDEBAR: DATA ENTRY ---
-st.sidebar.header("📝 Data Entry")
+po_db, bill_db = load_db()
 
-menu = st.sidebar.radio("Action", ["Add PO", "Add Bill", "Manage/Delete Data"])
+# --- SIDEBAR: BULK UPLOAD ---
+st.sidebar.header("📂 Bulk Data Upload")
+uploaded_po = st.sidebar.file_uploader("Upload POs (CSV/XLSX)", type=['csv', 'xlsx'])
+uploaded_bill = st.sidebar.file_uploader("Upload Bills (CSV/XLSX)", type=['csv', 'xlsx'])
 
-if menu == "Add PO":
-    with st.sidebar.form("po_form"):
-        po_num = st.text_input("PO Number")
-        vendor = st.text_input("Vendor Name")
-        order_date = st.date_input("Order Date")
-        val = st.number_input("Total Value", min_value=0)
-        if st.form_submit_button("Submit PO"):
-            add_po(po_num, vendor, pd.to_datetime(order_date), val)
-
-elif menu == "Add Bill":
-    with st.sidebar.form("bill_form"):
-        po_ref = st.selectbox("Select PO Reference", st.session_state.po_db['PO_Number'].unique())
-        item_name = st.text_input("Item Name")
-        inv_date = st.date_input("Invoice Date")
-        qty = st.number_input("Quantity", min_value=1)
-        if st.form_submit_button("Submit Bill"):
-            add_bill(po_ref, item_name, inv_date, qty)
-
-elif menu == "Manage/Delete Data":
-    st.sidebar.subheader("Delete Entries")
-    if not st.session_state.po_db.empty:
-        po_to_del = st.sidebar.selectbox("Delete PO", st.session_state.po_db['PO_Number'])
-        if st.sidebar.button("Confirm Delete PO"):
-            st.session_state.po_db = st.session_state.po_db[st.session_state.po_db['PO_Number'] != po_to_del]
-            st.session_state.bill_db = st.session_state.bill_db[st.session_state.bill_db['PO_Number'] != po_to_del]
-            st.rerun()
-
-# --- MAIN DASHBOARD ---
-st.title("📊 Supply Chain Lead Time Dashboard")
-
-if st.session_state.po_db.empty or st.session_state.bill_db.empty:
-    st.info("Please add at least one PO and one Bill to see analytics.")
-else:
-    # JOIN DATA
-    df = pd.merge(st.session_state.bill_db, st.session_state.po_db, on="PO_Number")
-    df['Lead_Time'] = (df['Invoice_Date'] - df['Order_Date']).dt.days
-
-    # VENDOR DROPDOWN
-    vendors = df['Vendor'].unique()
-    selected_v = st.selectbox("Filter by Vendor", vendors)
-    v_df = df[df['Vendor'] == selected_v]
-
-    # OUTPUTS
-    c1, c2 = st.columns(2)
-    with c1:
-        avg_po = v_df.groupby('PO_Number')['Lead_Time'].mean().reset_index()
-        st.plotly_chart(px.bar(avg_po, x='PO_Number', y='Lead_Time', title="Avg Lead Time per PO"), use_container_width=True)
+if st.sidebar.button("Process & Append Uploads"):
+    if uploaded_po:
+        new_pos = pd.read_csv(uploaded_po) if uploaded_po.name.endswith('.csv') else pd.read_excel(uploaded_po)
+        new_pos['Order_Date'] = pd.to_datetime(new_pos['Order_Date'])
+        # Deduplicate based on PO_Number
+        po_db = pd.concat([po_db, new_pos]).drop_duplicates(subset=['PO_Number'], keep='first')
     
-    with c2:
-        avg_item = v_df.groupby('Item')['Lead_Time'].mean().reset_index()
-        st.plotly_chart(px.bar(avg_item, x='Item', y='Lead_Time', title="Avg Lead Time by Item"), use_container_width=True)
+    if uploaded_bill:
+        new_bills = pd.read_csv(uploaded_bill) if uploaded_bill.name.endswith('.csv') else pd.read_excel(uploaded_bill)
+        new_bills['Invoice_Date'] = pd.to_datetime(new_bills['Invoice_Date'])
+        # Deduplicate based on PO, Item, and Date
+        bill_db = pd.concat([bill_db, new_bills]).drop_duplicates(subset=['PO_Number', 'Item', 'Invoice_Date'], keep='first')
+    
+    save_db(po_db, bill_db)
+    st.sidebar.success("Database Updated!")
+    st.rerun()
 
-    st.subheader("Current Database View")
-    st.dataframe(v_df)
+# --- DATA MANAGEMENT ---
+st.sidebar.divider()
+if st.sidebar.button("🗑️ Clear All Data"):
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+    st.rerun()
+
+# --- ANALYTICS ENGINE ---
+st.title("🚀 Supplier Lead Time Analytics")
+
+if po_db.empty or bill_db.empty:
+    st.warning("Please upload PO and Bill files to begin. Ensure columns match: [PO_Number, Vendor, Order_Date] and [PO_Number, Item, Invoice_Date, Qty].")
+else:
+    # Logic: Join and Calculate
+    merged = pd.merge(bill_db, po_db, on="PO_Number", how="inner")
+    merged['Lead_Time'] = (pd.to_datetime(merged['Invoice_Date']) - pd.to_datetime(merged['Order_Date'])).dt.days
+
+    # 1. Vendor Dropdown
+    vendor_choice = st.selectbox("Select Vendor to Analyze", options=merged['Vendor'].unique())
+    v_df = merged[merged['Vendor'] == vendor_choice]
+
+    # 2. Metrics & Charts
+    m1, m2 = st.columns(2)
+    
+    with m1:
+        # View of avg lead time for each PO
+        po_avg = v_df.groupby('PO_Number')['Lead_Time'].mean().reset_index()
+        fig1 = px.bar(po_avg, x='PO_Number', y='Lead_Time', title="Average Lead Time per Purchase Order", color_discrete_sequence=['#3366CC'])
+        st.plotly_chart(fig1, use_container_width=True)
+
+    with m2:
+        # Metric of avg lead time by item
+        item_avg = v_df.groupby('Item')['Lead_Time'].mean().reset_index()
+        fig2 = px.bar(item_avg, x='Item', y='Lead_Time', title="Lead Time Efficiency by Item", color='Lead_Time', color_continuous_scale='Viridis')
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # 3. Data Management Table (Delete option)
+    st.subheader("Manage Database Entries")
+    tab1, tab2 = st.tabs(["Purchase Orders", "Vendor Bills"])
+    
+    with tab1:
+        st.write("To delete a PO, identify the number and use the sidebar (or clear all).")
+        st.dataframe(po_db, use_container_width=True)
+        
+    with tab2:
+        st.dataframe(bill_db, use_container_width=True)
