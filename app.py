@@ -9,10 +9,6 @@ st.set_page_config(page_title="Vendor Lead Time Tracker", layout="wide")
 TARGET_VENDORS = ["Candor Foods Pvt Ltd.", "Evergreen Foods and Snacks Pvt Ltd"]
 DB_FILE = "vendor_analytics_db.xlsx"
 
-def clean_currency(column):
-    """Removes currency symbols and commas to convert to float."""
-    return column.replace(r'[₹,]', '', regex=True).astype(float)
-
 def load_data():
     if os.path.exists(DB_FILE):
         return pd.read_excel(DB_FILE, sheet_name="POs"), pd.read_excel(DB_FILE, sheet_name="Bills")
@@ -26,14 +22,14 @@ po_file = st.sidebar.file_uploader("Upload Purchase Order CSV", type="csv")
 bill_files = st.sidebar.file_uploader("Upload Bill CSVs", type="csv", accept_multiple_files=True)
 
 if st.sidebar.button("Process Data"):
-    # Process POs
     if po_file:
         df_po = pd.read_csv(po_file)
         df_po = df_po[df_po['Vendor Name'].isin(TARGET_VENDORS)]
         df_po['Purchase Order Date'] = pd.to_datetime(df_po['Purchase Order Date'], dayfirst=True)
+        # Clean PO Numbers for better matching
+        df_po['Purchase Order Number'] = df_po['Purchase Order Number'].astype(str).str.strip()
         po_db = df_po.drop_duplicates(subset=['Purchase Order Number', 'Item Name'])
 
-    # Process Bills
     bill_list = []
     if bill_files:
         for f in bill_files:
@@ -41,11 +37,12 @@ if st.sidebar.button("Process Data"):
             # Standardize column names based on your uploaded files
             if 'Reference Number' in temp_df.columns: # Bills (1)
                 temp_df = temp_df.rename(columns={'Reference Number': 'PO_Ref', 'Date': 'Bill_Date'})
-            elif 'Bill Number' in temp_df.columns: # Bill (2)
-                temp_df = temp_df.rename(columns={'Bill Number': 'Bill_No', 'Bill Date': 'Bill_Date', 'Reference Invoice Type': 'PO_Ref'})
+            elif 'Reference Invoice Type' in temp_df.columns: # Bill (2)
+                temp_df = temp_df.rename(columns={'Reference Invoice Type': 'PO_Ref', 'Bill Date': 'Bill_Date'})
             
             temp_df = temp_df[temp_df['Vendor Name'].isin(TARGET_VENDORS)]
-            temp_df['Bill_Date'] = pd.to_datetime(temp_df['Bill_Date'], dayfirst=True, errors='coerce')
+            temp_df['Bill_Date'] = pd.to_datetime(temp_df['Bill_Date'], errors='coerce')
+            temp_df['PO_Ref'] = temp_df['PO_Ref'].astype(str).str.strip()
             bill_list.append(temp_df)
         
         if bill_list:
@@ -57,14 +54,13 @@ if st.sidebar.button("Process Data"):
     st.sidebar.success("Analysis Ready!")
     st.rerun()
 
-# --- OUTPUT / ANALYTICS ---
+# --- ANALYTICS ---
 st.title("📊 Vendor Performance Analytics")
 
 if po_db.empty or bill_db.empty:
-    st.info("Upload files and click 'Process Data' to view analytics for Candor and Evergreen.")
+    st.info("Upload your PO and Bill files to see the analysis for Candor and Evergreen.")
 else:
-    # Merge Logic
-    # We join on PO Number. Note: In your Bills, this is 'PO_Ref'
+    # Joining the data
     merged = pd.merge(
         bill_db, 
         po_db, 
@@ -73,38 +69,44 @@ else:
         how='inner'
     )
     
+    # After merging, 'Item Name' becomes 'Item Name_y' (from PO) or 'Item Name_x' (from Bill)
+    # We use the item name from the PO record for consistency
+    item_col = 'Item Name_y' if 'Item Name_y' in merged.columns else 'Item Name'
+    vendor_col = 'Vendor Name_y' if 'Vendor Name_y' in merged.columns else 'Vendor Name'
+
     # Calculate Lead Time
     merged['Lead_Time'] = (merged['Bill_Date'] - merged['Purchase Order Date']).dt.days
-    # Filter out any negative lead times (date errors)
-    merged = merged[merged['Lead_Time'] >= 0]
+    merged = merged[merged['Lead_Time'] >= 0] # Filter out data errors
 
-    # 1. Vendor Dropdown
+    # Filter by selected vendor
     selected_vendor = st.selectbox("Select Vendor", TARGET_VENDORS)
-    v_data = merged[merged['Vendor Name_x'] == selected_vendor]
+    v_data = merged[merged[vendor_col] == selected_vendor]
 
-    # 2. Layout
-    col1, col2 = st.columns(2)
+    if not v_data.empty:
+        col1, col2 = st.columns(2)
 
-    with col1:
-        st.subheader("Avg Lead Time per PO")
-        po_metrics = v_data.groupby('Purchase Order Number')['Lead_Time'].mean().reset_index()
-        fig_po = px.bar(po_metrics, x='Purchase Order Number', y='Lead_Time', 
-                        color='Lead_Time', title=f"Fulfillment Speed: {selected_vendor}")
-        st.plotly_chart(fig_po, use_container_width=True)
+        with col1:
+            st.subheader("Avg Lead Time per PO")
+            po_metrics = v_data.groupby('Purchase Order Number')['Lead_Time'].mean().reset_index()
+            fig_po = px.bar(po_metrics, x='Purchase Order Number', y='Lead_Time', 
+                            title="Days from PO to Bill Date")
+            st.plotly_chart(fig_po, use_container_width=True)
 
-    with col2:
-        st.subheader("Avg Lead Time by Item")
-        item_metrics = v_data.groupby('Item Name')['Lead_Time'].mean().reset_index()
-        fig_item = px.bar(item_metrics, x='Lead_Time', y='Item Name', orientation='h',
-                         title="Item-wise Delivery Delay", color_continuous_scale='Reds')
-        st.plotly_chart(fig_item, use_container_width=True)
+        with col2:
+            st.subheader("Avg Lead Time by Item")
+            # FIXED: Using the corrected column name from the merge
+            item_metrics = v_data.groupby(item_col)['Lead_Time'].mean().reset_index()
+            fig_item = px.bar(item_metrics, x='Lead_Time', y=item_col, orientation='h',
+                             title="Average Delay by Product", color='Lead_Time',
+                             color_continuous_scale='Reds')
+            st.plotly_chart(fig_item, use_container_width=True)
 
-    # 3. Management View
-    with st.expander("View / Delete Specific Entries"):
-        st.write("Full Transaction Record:")
-        st.dataframe(v_data[['Purchase Order Number', 'Bill_Date', 'Item Name', 'Lead_Time']])
-        
-        if st.button("Delete Entire Database"):
-            if os.path.exists(DB_FILE):
-                os.remove(DB_FILE)
-                st.rerun()
+        st.subheader("Fulfillment Detail Table")
+        st.dataframe(v_data[['Purchase Order Number', 'Bill_Date', item_col, 'Lead_Time']])
+    else:
+        st.warning(f"No matching PO and Bill records found for {selected_vendor}. Ensure PO numbers in Bill files match the PO file exactly.")
+
+if st.sidebar.button("🗑️ Reset Database"):
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+    st.rerun()
