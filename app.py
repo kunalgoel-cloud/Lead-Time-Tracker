@@ -229,14 +229,32 @@ def get_walt(df: pd.DataFrame) -> float:
     return df["W_Comp"].sum() / total_q if total_q > 0 else 0.0
 
 
-# ── VENDOR FILTER ──────────────────────────────────────────────────────────────
-vendor_choice = st.selectbox(
-    "Filter by Vendor", ["All Vendors"] + TARGET_VENDORS
-)
-view_df = f_df if vendor_choice == "All Vendors" else f_df[f_df["Vendor Name"] == vendor_choice]
+# ── FILTERS ────────────────────────────────────────────────────────────────────
+col_f1, col_f2, col_f3 = st.columns(3)
+
+with col_f1:
+    vendor_choice = st.selectbox("Filter by Vendor", ["All Vendors"] + TARGET_VENDORS)
+
+# Derive min/max dates from PO Date for the date range picker
+min_date = f_df["Purchase Order Date"].min().date()
+max_date = f_df["Purchase Order Date"].max().date()
+
+with col_f2:
+    date_from = st.date_input("PO Date From", value=min_date, min_value=min_date, max_value=max_date)
+with col_f3:
+    date_to = st.date_input("PO Date To", value=max_date, min_value=min_date, max_value=max_date)
+
+# Apply filters
+view_df = f_df.copy()
+if vendor_choice != "All Vendors":
+    view_df = view_df[view_df["Vendor Name"] == vendor_choice]
+view_df = view_df[
+    (view_df["Purchase Order Date"].dt.date >= date_from) &
+    (view_df["Purchase Order Date"].dt.date <= date_to)
+]
 
 if view_df.empty:
-    st.warning("No data available for the selected vendor.")
+    st.warning("No data available for the selected filters.")
     st.stop()
 
 # ── KPI METRICS ────────────────────────────────────────────────────────────────
