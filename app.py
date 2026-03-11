@@ -3,9 +3,8 @@ import pandas as pd
 import plotly.express as px
 import os
 
-st.set_page_config(page_title="Vendor Performance Dashboard", layout="wide")
+st.set_page_config(page_title="Weighted Lead Time Tracker", layout="wide")
 
-# --- CONFIG ---
 TARGET_VENDORS = ["Candor Foods Pvt Ltd.", "Evergreen Foods and Snacks Pvt Ltd"]
 DB_FILE = "vendor_analytics_db.xlsx"
 
@@ -19,7 +18,7 @@ def load_data():
 
 po_db, bill_db = load_data()
 
-# --- SIDEBAR: UPLOADS ---
+# --- SIDEBAR: DATA UPLOAD ---
 st.sidebar.header("📂 Data Management")
 po_file = st.sidebar.file_uploader("Upload Purchase Order CSV", type="csv")
 bill_files = st.sidebar.file_uploader("Upload Bill CSVs", type="csv", accept_multiple_files=True)
@@ -36,6 +35,10 @@ if st.sidebar.button("Process & Save Data"):
     if bill_files:
         for f in bill_files:
             temp_df = pd.read_csv(f)
+            # Normalize Invoice Qty column names based on your files
+            if 'Quantity' in temp_df.columns:
+                temp_df = temp_df.rename(columns={'Quantity': 'Inv_Qty'})
+            # Normalize Reference Number
             if 'Reference Number' in temp_df.columns: 
                 temp_df = temp_df.rename(columns={'Reference Number': 'PO_Ref', 'Date': 'Bill_Date'})
             elif 'Reference Invoice Type' in temp_df.columns: 
@@ -56,17 +59,17 @@ if st.sidebar.button("Process & Save Data"):
     st.rerun()
 
 # --- ANALYTICS ENGINE ---
-st.title("📊 Supplier Lead Time & Value Tracker")
+st.title("📊 Supplier Performance: Weighted Lead Time")
 
 if po_db.empty or bill_db.empty:
     st.info("Please upload data to view the dashboard.")
 else:
-    # 1. MERGE & CLEAN
+    # 1. MERGE
     merged = pd.merge(bill_db, po_db, left_on='PO_Ref', right_on='Purchase Order Number', how='inner')
     merged['Lead_Time'] = (merged['Bill_Date'] - merged['Purchase Order Date']).dt.days
     merged = merged[merged['Lead_Time'] >= 0] 
 
-    # DYNAMIC COLUMN MAPPING (Handles suffixes like _x or _y)
+    # Dynamic Column Mapping
     def get_col(base_name, df):
         if f"{base_name}_y" in df.columns: return f"{base_name}_y"
         if f"{base_name}_x" in df.columns: return f"{base_name}_x"
@@ -75,9 +78,14 @@ else:
     item_col = get_col('Item Name', merged)
     vendor_col = get_col('Vendor Name', merged)
     val_col = get_col('Item Total', merged)
-    qty_col = get_col('QuantityOrdered', merged)
+    po_qty_col = get_col('QuantityOrdered', merged)
+    inv_qty_col = 'Inv_Qty' if 'Inv_Qty' in merged.columns else 'Quantity'
 
-    # 2. FILTERS
+    # 2. WEIGHTED CALCULATION
+    # Calculation: (Lead Time * Invoice Qty) 
+    merged['weighted_component'] = merged['Lead_Time'] * merged[inv_qty_col]
+
+    # 3. FILTERS
     st.sidebar.divider()
     vendor_choice = st.sidebar.selectbox("Filter Vendor", ["All"] + sorted(merged[vendor_col].unique().tolist()))
     f_df = merged.copy()
@@ -88,37 +96,37 @@ else:
     if len(dr) == 2:
         f_df = f_df[(f_df['Purchase Order Date'].dt.date >= dr[0]) & (f_df['Purchase Order Date'].dt.date <= dr[1])]
 
-    selected_po = st.sidebar.selectbox("Filter PO", ["All"] + sorted(f_df['Purchase Order Number'].unique().tolist()))
-    if selected_po != "All":
-        f_df = f_df[f_df['Purchase Order Number'] == selected_po]
+    # 4. KPI METRICS (Weighted)
+    def calc_weighted_avg(df):
+        total_qty = df[inv_qty_col].sum()
+        if total_qty == 0: return 0
+        return df['weighted_component'].sum() / total_qty
 
-    selected_item = st.sidebar.selectbox("Filter Item", ["All"] + sorted(f_df[item_col].unique().tolist()))
-    if selected_item != "All":
-        f_df = f_df[f_df[item_col] == selected_item]
-
-    # 3. TOP METRICS
-    # Deduplicate to get accurate PO totals
-    unique_entries = f_df.drop_duplicates(subset=['Purchase Order Number', item_col])
+    unique_pos = f_df.drop_duplicates(subset=['Purchase Order Number', item_col])
     
     m1, m2, m3 = st.columns(3)
-    m1.metric("Total PO Value", f"₹{unique_entries[val_col].sum():,.2f}")
+    m1.metric("Total PO Value", f"₹{unique_pos[val_col].sum():,.2f}")
     m2.metric("Total POs", f_df['Purchase Order Number'].nunique())
-    m3.metric("Avg Lead Time", f"{f_df['Lead_Time'].mean():.1f} Days")
+    m3.metric("Weighted Avg Lead Time", f"{calc_weighted_avg(f_df):.1f} Days")
 
-    # 4. CHARTS
+    # 5. CHARTS
     c1, c2 = st.columns(2)
     with c1:
-        po_chart = f_df.groupby('Purchase Order Number')['Lead_Time'].mean().reset_index()
-        st.plotly_chart(px.bar(po_chart, x='Purchase Order Number', y='Lead_Time', title="Avg Lead Time per PO"), use_container_width=True)
+        # Weighted LT per PO
+        po_group = f_df.groupby('Purchase Order Number').apply(lambda x: calc_weighted_avg(x)).reset_index(name='W_LT')
+        st.plotly_chart(px.bar(po_group, x='Purchase Order Number', y='W_LT', title="Weighted Lead Time per PO"), use_container_width=True)
     with c2:
-        item_chart = f_df.groupby(item_col)['Lead_Time'].mean().reset_index()
-        st.plotly_chart(px.bar(item_chart, x='Lead_Time', y=item_col, orientation='h', title="Avg Lead Time by Item"), use_container_width=True)
+        # Weighted LT per Item
+        item_group = f_df.groupby(item_col).apply(lambda x: calc_weighted_avg(x)).reset_index(name='W_LT')
+        st.plotly_chart(px.bar(item_group, x='W_LT', y=item_col, orientation='h', title="Weighted Lead Time by Item"), use_container_width=True)
 
-    # 5. TABLE
+    # 6. TABLE
     st.subheader("Data Detail View")
-    final_table = f_df[['Purchase Order Number', 'Purchase Order Date', vendor_col, item_col, qty_col, val_col, 'Bill_Date', 'Lead_Time']]
-    st.dataframe(final_table.rename(columns={vendor_col: 'Vendor', item_col: 'Item', val_col: 'Value', qty_col: 'Qty'}), use_container_width=True)
-
-if st.sidebar.button("🗑️ Reset Database"):
-    if os.path.exists(DB_FILE): os.remove(DB_FILE)
-    st.rerun()
+    final_table = f_df[[
+        'Purchase Order Number', 'Purchase Order Date', vendor_col, 
+        item_col, po_qty_col, inv_qty_col, val_col, 'Bill_Date', 'Lead_Time'
+    ]]
+    st.dataframe(final_table.rename(columns={
+        vendor_col: 'Vendor', item_col: 'Item', 
+        val_col: 'Value', po_qty_col: 'PO Qty', inv_qty_col: 'Invoice Qty'
+    }), use_container_width=True)
