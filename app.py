@@ -3,7 +3,7 @@ import pandas as pd
 import plotly.express as px
 import os
 
-st.set_page_config(page_title="Vendor Analytics: Weighted Lead Time", layout="wide")
+st.set_page_config(page_title="Weighted Lead Time Tracker", layout="wide")
 
 # --- CONFIG ---
 TARGET_VENDORS = ["Candor Foods Pvt Ltd.", "Evergreen Foods and Snacks Pvt Ltd"]
@@ -25,43 +25,43 @@ po_file = st.sidebar.file_uploader("Upload Purchase Order CSV", type="csv")
 bill_files = st.sidebar.file_uploader("Upload Bill CSVs", type="csv", accept_multiple_files=True)
 
 if st.sidebar.button("Process & Update Data"):
-    # 1. PROCESS POs
     if po_file:
         df_po = pd.read_csv(po_file)
         df_po['Vendor Name'] = df_po['Vendor Name'].str.strip()
         df_po = df_po[df_po['Vendor Name'].isin(TARGET_VENDORS)]
         df_po['Purchase Order Date'] = pd.to_datetime(df_po['Purchase Order Date'], dayfirst=True, errors='coerce')
         df_po['Purchase Order Number'] = df_po['Purchase Order Number'].astype(str).str.strip()
-        df_po['QuantityOrdered'] = pd.to_numeric(df_po['QuantityOrdered'], errors='coerce').fillna(0)
-        df_po['Item Total'] = pd.to_numeric(df_po['Item Total'], errors='coerce').fillna(0)
         po_db = df_po.drop_duplicates()
 
-    # 2. PROCESS BILLS
     all_bills = []
     if bill_files:
         for f in bill_files:
             temp = pd.read_csv(f)
             
-            # Standardize column mapping based on file patterns
+            # 1. Identify PO Reference Column
             ref_col = 'Reference Number' if 'Reference Number' in temp.columns else 'Reference Invoice Type'
-            date_col = 'Date' if 'Date' in temp.columns else 'Bill Date'
-            item_col = 'Item Name' if 'Item Name' in temp.columns else None
-            qty_col = 'Quantity' if 'Quantity' in temp.columns else None
+            if ref_col not in temp.columns: continue
             
-            # Normalize row data
-            temp['PO_Ref'] = temp[ref_col].astype(str).str.strip() if ref_col in temp.columns else None
-            temp['Bill_Date'] = pd.to_datetime(temp[date_col], dayfirst=True, errors='coerce')
-            temp['Vendor Name'] = temp['Vendor Name'].str.strip()
-            temp['Item_Name_Bill'] = temp[item_col] if item_col else None
+            # 2. Extract Invoice Quantity (Specifically from Bill 2 pattern)
+            # We look for 'Quantity' first, then 'Qty'
+            actual_qty_col = None
+            if 'Quantity' in temp.columns: actual_qty_col = 'Quantity'
+            elif 'Qty' in temp.columns: actual_qty_col = 'Qty'
             
-            # Capture quantity from Bill (2) specifically
-            if qty_col:
-                temp['Inv_Qty'] = pd.to_numeric(temp[qty_col], errors='coerce')
+            # 3. Create Standardized Bill Record
+            std_bill = pd.DataFrame()
+            std_bill['PO_Ref'] = temp[ref_col].astype(str).str.strip()
+            std_bill['Bill_Date'] = pd.to_datetime(temp['Date'] if 'Date' in temp.columns else temp['Bill Date'], dayfirst=True, errors='coerce')
+            std_bill['Vendor Name'] = temp['Vendor Name'].str.strip()
+            std_bill['Item_Name_Bill'] = temp['Item Name'] if 'Item Name' in temp.columns else None
+            
+            if actual_qty_col:
+                std_bill['Inv_Qty'] = pd.to_numeric(temp[actual_qty_col], errors='coerce')
             else:
-                temp['Inv_Qty'] = None # Will be inferred from PO for Bills (1)
+                std_bill['Inv_Qty'] = None # To be filled from PO for header bills
             
-            temp = temp[temp['Vendor Name'].isin(TARGET_VENDORS)]
-            all_bills.append(temp[['PO_Ref', 'Bill_Date', 'Vendor Name', 'Item_Name_Bill', 'Inv_Qty']])
+            std_bill = std_bill[std_bill['Vendor Name'].isin(TARGET_VENDORS)]
+            all_bills.append(std_bill)
         
         if all_bills:
             bill_db = pd.concat(all_bills).drop_duplicates()
@@ -73,72 +73,61 @@ if st.sidebar.button("Process & Update Data"):
     st.rerun()
 
 # --- ANALYTICS ENGINE ---
-st.title("📊 Vendor Efficiency: Weighted Lead Time Tracker")
+st.title("📊 Supplier Performance: Weighted Lead Time")
 
 if po_db.empty or bill_db.empty:
     st.info("Upload your PO and Bill files and click 'Process' to see the metrics.")
 else:
-    # 1. ADVANCED MERGE
-    # We join bills with specific item names (Bill 2) and header-level bills (Bills 1)
-    b_with_items = bill_db[bill_db['Item_Name_Bill'].notna()]
-    b_no_items = bill_db[bill_db['Item_Name_Bill'].isna()]
+    # 1. MERGE LOGIC (Handling Item-level vs Header-level bills)
+    # Check if we have item-level info to merge on
+    if 'Item_Name_Bill' in bill_db.columns and bill_db['Item_Name_Bill'].notna().any():
+        item_bills = bill_db[bill_db['Item_Name_Bill'].notna()]
+        header_bills = bill_db[bill_db['Item_Name_Bill'].isna()]
+        
+        merged_items = pd.merge(item_bills, po_db, left_on=['PO_Ref', 'Item_Name_Bill'], 
+                                right_on=['Purchase Order Number', 'Item Name'], how='inner')
+        merged_headers = pd.merge(header_bills, po_db, left_on='PO_Ref', 
+                                  right_on='Purchase Order Number', how='inner')
+        f_df = pd.concat([merged_items, merged_headers])
+    else:
+        f_df = pd.merge(bill_db, po_db, left_on='PO_Ref', right_on='Purchase Order Number', how='inner')
 
-    m_a = pd.merge(b_with_items, po_db, left_on=['PO_Ref', 'Item_Name_Bill'], 
-                   right_on=['Purchase Order Number', 'Item Name'], how='inner')
-    
-    m_b = pd.merge(b_no_items, po_db, left_on='PO_Ref', 
-                   right_on='Purchase Order Number', how='inner')
-
-    f_df = pd.concat([m_a, m_b])
-    
     # 2. CALCULATIONS
     f_df['Lead_Time'] = (f_df['Bill_Date'] - f_df['Purchase Order Date']).dt.days
     f_df = f_df[f_df['Lead_Time'] >= 0]
     
-    # Correcting Invoice Qty: Use Bill Quantity if exists, else assume full PO delivery (for header bills)
-    f_df['Invoice_Qty_Final'] = f_df['Inv_Qty'].fillna(f_df['QuantityOrdered'])
-    f_df['Weighted_LT_Component'] = f_df['Lead_Time'] * f_df['Invoice_Qty_Final']
+    # Fill missing Invoice Qty with PO Qty (for Bills 1)
+    f_df['Inv_Qty_Final'] = f_df['Inv_Qty'].fillna(f_df['QuantityOrdered'])
+    f_df['W_Comp'] = f_df['Lead_Time'] * f_df['Inv_Qty_Final']
 
-    # 3. FILTERS
-    st.sidebar.divider()
-    vendor_sel = st.sidebar.selectbox("Filter Vendor", ["All"] + sorted(f_df['Vendor Name_y'].unique().tolist()))
-    if vendor_sel != "All": f_df = f_df[f_df['Vendor Name_y'] == vendor_sel]
+    # 3. KPI CALCULATIONS
+    def get_walt(df):
+        total_q = df['Inv_Qty_Final'].sum()
+        return df['W_Comp'].sum() / total_q if total_q > 0 else 0
 
-    dr = st.sidebar.date_input("PO Date Range", [f_df['Purchase Order Date'].min(), f_df['Purchase Order Date'].max()])
-    if len(dr) == 2:
-        f_df = f_df[(f_df['Purchase Order Date'].dt.date >= dr[0]) & (f_df['Purchase Order Date'].dt.date <= dr[1])]
-
-    po_sel = st.sidebar.selectbox("Filter PO Number", ["All"] + sorted(f_df['Purchase Order Number'].unique().tolist()))
-    if po_sel != "All": f_df = f_df[f_df['Purchase Order Number'] == po_sel]
-
-    it_sel = st.sidebar.selectbox("Filter Item Name", ["All"] + sorted(f_df['Item Name'].unique().tolist()))
-    if it_sel != "All": f_df = f_df[f_df['Item Name'] == it_sel]
-
-    # 4. KPI SUMMARY
-    def calc_walt(df):
-        total_q = df['Invoice_Qty_Final'].sum()
-        return df['Weighted_LT_Component'].sum() / total_q if total_q > 0 else 0
-
-    unique_pos = f_df.drop_duplicates(subset=['Purchase Order Number', 'Item Name'])
-    
     m1, m2, m3 = st.columns(3)
-    m1.metric("Total PO Value", f"₹{unique_pos['Item Total'].sum():,.2f}")
-    m2.metric("Number of POs", f_df['Purchase Order Number'].nunique())
-    m3.metric("Weighted Avg Lead Time", f"{calc_walt(f_df):.1f} Days")
+    unique_pos = f_df.drop_duplicates(subset=['Purchase Order Number', 'Item Name'])
+    m1.metric("Total Order Value", f"₹{unique_pos['Item Total'].sum():,.2f}")
+    m2.metric("Total POs", f_df['Purchase Order Number'].nunique())
+    m3.metric("Weighted Avg Lead Time", f"{get_walt(f_df):.1f} Days")
 
-    # 5. CHARTS
+    # 4. VISUALS
     c1, c2 = st.columns(2)
     with c1:
-        chart_po = f_df.groupby('Purchase Order Number').apply(calc_walt).reset_index(name='WALT')
-        st.plotly_chart(px.bar(chart_po, x='Purchase Order Number', y='WALT', title="Weighted LT per PO"), use_container_width=True)
+        po_group = f_df.groupby('Purchase Order Number').apply(get_walt).reset_index(name='WLT')
+        st.plotly_chart(px.bar(po_group, x='Purchase Order Number', y='WLT', title="Weighted LT per PO"), use_container_width=True)
     with c2:
-        chart_item = f_df.groupby('Item Name').apply(calc_walt).reset_index(name='WALT')
-        st.plotly_chart(px.bar(chart_item, x='WALT', y='Item Name', orientation='h', title="Lead Time by Item"), use_container_width=True)
+        item_group = f_df.groupby('Item Name').apply(get_walt).reset_index(name='WLT')
+        st.plotly_chart(px.bar(item_group, x='WLT', y='Item Name', orientation='h', title="Efficiency by Item"), use_container_width=True)
 
-    # 6. TABLE
-    st.subheader("📋 Order & Fulfillment Ledger")
+    # 5. TABLE
+    st.subheader("Fulfillment Record")
     st.dataframe(f_df[['Purchase Order Number', 'Purchase Order Date', 'Vendor Name_y', 'Item Name', 
-                       'QuantityOrdered', 'Invoice_Qty_Final', 'Item Total', 'Bill_Date', 'Lead_Time']]
-                 .rename(columns={'Vendor Name_y': 'Vendor', 'QuantityOrdered': 'PO Quantity', 
-                                  'Invoice_Qty_Final': 'Invoice Quantity', 'Item Total': 'Value'}), 
+                       'QuantityOrdered', 'Inv_Qty_Final', 'Item Total', 'Bill_Date', 'Lead_Time']]
+                 .rename(columns={'Vendor Name_y': 'Vendor', 'QuantityOrdered': 'PO Qty', 
+                                  'Inv_Qty_Final': 'Invoice Qty', 'Item Total': 'Value'}), 
                  use_container_width=True)
+
+if st.sidebar.button("🗑️ Reset All"):
+    if os.path.exists(DB_FILE): os.remove(DB_FILE)
+    st.rerun()
