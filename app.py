@@ -203,6 +203,22 @@ with col_f2:
 with col_f3:
     date_to   = st.date_input("PO Date To",   value=max_date, min_value=min_date, max_value=max_date)
 
+# PO number filter — list is scoped to vendor + date selection so only relevant POs show
+_pre = f_df.copy()
+if vendor_choice != "All Vendors":
+    _pre = _pre[_pre["Vendor Name"] == vendor_choice]
+_pre = _pre[
+    (_pre["Purchase Order Date"].dt.date >= date_from) &
+    (_pre["Purchase Order Date"].dt.date <= date_to)
+]
+available_pos = sorted(_pre["Purchase Order Number"].dropna().unique().tolist())
+po_filter = st.multiselect(
+    "Filter by PO Number",
+    options=available_pos,
+    default=[],
+    placeholder="All POs (select to narrow down…)",
+)
+
 view_df = f_df.copy()
 if vendor_choice != "All Vendors":
     view_df = view_df[view_df["Vendor Name"] == vendor_choice]
@@ -210,6 +226,8 @@ view_df = view_df[
     (view_df["Purchase Order Date"].dt.date >= date_from) &
     (view_df["Purchase Order Date"].dt.date <= date_to)
 ]
+if po_filter:
+    view_df = view_df[view_df["Purchase Order Number"].isin(po_filter)]
 
 if view_df.empty:
     st.warning("No data for the selected filters.")
