@@ -212,12 +212,23 @@ _pre = _pre[
     (_pre["Purchase Order Date"].dt.date <= date_to)
 ]
 available_pos = sorted(_pre["Purchase Order Number"].dropna().unique().tolist())
-po_filter = st.multiselect(
-    "Filter by PO Number",
-    options=available_pos,
-    default=[],
-    placeholder="All POs (select to narrow down…)",
-)
+available_items = sorted(_pre["Item Name Display"].dropna().unique().tolist())
+
+fc1, fc2 = st.columns(2)
+with fc1:
+    po_filter = st.multiselect(
+        "Filter by PO Number",
+        options=available_pos,
+        default=[],
+        placeholder="All POs (select to narrow down…)",
+    )
+with fc2:
+    item_filter = st.multiselect(
+        "Filter by Item Name",
+        options=available_items,
+        default=[],
+        placeholder="All items (select to narrow down…)",
+    )
 
 view_df = f_df.copy()
 if vendor_choice != "All Vendors":
@@ -228,6 +239,8 @@ view_df = view_df[
 ]
 if po_filter:
     view_df = view_df[view_df["Purchase Order Number"].isin(po_filter)]
+if item_filter:
+    view_df = view_df[view_df["Item Name Display"].isin(item_filter)]
 
 if view_df.empty:
     st.warning("No data for the selected filters.")
